@@ -40,24 +40,28 @@ async fn run_powercfg(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Parses `Current AC Power Setting Index: 0x........` /
-/// `Current DC Power Setting Index: 0x........` out of a `/qh` block. Both
+/// Parses the current AC / DC setting indices out of a `/qh` block. Both
 /// lines are required — a block missing either (setting alias not found at
 /// all, distinct from the "hidden but present" case `/qh` already handles)
 /// is reported as an error, not a default.
+///
+/// The line labels (`Current AC Power Setting Index:` on an English
+/// system) are localized by Windows, so they are never matched. The
+/// locale-independent shape is that a setting block always ends with the
+/// AC index line followed by the DC index line, each `<label>: 0x........`;
+/// the min/max/increment lines of a ranged setting share that value shape
+/// but precede them, so the last two hex-valued lines are AC then DC.
 fn parse_ac_dc(qh_output: &str) -> Result<AcDc<u32>> {
-    let mut ac = None;
-    let mut dc = None;
-    for line in qh_output.lines() {
-        let line = line.trim();
-        if let Some(hex) = line.strip_prefix("Current AC Power Setting Index:") {
-            ac = u32::from_str_radix(hex.trim().trim_start_matches("0x"), 16).ok();
-        } else if let Some(hex) = line.strip_prefix("Current DC Power Setting Index:") {
-            dc = u32::from_str_radix(hex.trim().trim_start_matches("0x"), 16).ok();
-        }
-    }
-    match (ac, dc) {
-        (Some(ac), Some(dc)) => Ok(AcDc { ac, dc }),
+    let hex_values: Vec<u32> = qh_output
+        .lines()
+        .filter_map(|line| {
+            let (_, value) = line.trim().rsplit_once(':')?;
+            let hex = value.trim().strip_prefix("0x")?;
+            u32::from_str_radix(hex, 16).ok()
+        })
+        .collect();
+    match hex_values[..] {
+        [.., ac, dc] => Ok(AcDc { ac, dc }),
         _ => Err(Error::msg(format!(
             "could not find both AC and DC power setting indices in powercfg output:\n{qh_output}"
         ))),
@@ -117,6 +121,30 @@ Power Scheme GUID: 206b3296-170d-49f3-b100-f9c11b379c23  (Custom)
     fn parses_ranged_setting_block_captured_from_the_real_rig() {
         assert_eq!(
             parse_ac_dc(SAMPLE_QH_RANGED).unwrap(),
+            AcDc { ac: 0x64, dc: 0x0a }
+        );
+    }
+
+    // Synthetic (not captured): the ranged block above with every label
+    // replaced by non-English text of the shape Windows produces on a
+    // localized system. A German alpha tester hit exactly this on
+    // `powercfg /list` (see `power_plan.rs`), and `/qh` localizes its
+    // labels the same way, so the parser must not depend on them.
+    const SAMPLE_QH_LOCALIZED: &str = r#"
+    Energieeinstellungs-GUID: 0cc5b647-c1df-4637-891a-dec35c318583  (Mindestanzahl Kerne)
+      GUID-Alias: CPMINCORES
+      Minimale Einstellung: 0x00000000
+      Maximale Einstellung: 0x00000064
+      Schrittweite: 0x00000001
+      Einheiten: %
+    Aktueller Wechselstrom-Index: 0x00000064
+    Aktueller Gleichstrom-Index: 0x0000000a
+"#;
+
+    #[test]
+    fn parses_localized_labels_without_matching_english_text() {
+        assert_eq!(
+            parse_ac_dc(SAMPLE_QH_LOCALIZED).unwrap(),
             AcDc { ac: 0x64, dc: 0x0a }
         );
     }

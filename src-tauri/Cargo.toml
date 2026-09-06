@@ -1,6 +1,6 @@
 [package]
 name = "voidframe"
-version = "0.1.0"
+version = "0.1.1"
 description = "baiersoft // VOIDFRAME — Autonomous CS2 Benchmark Orchestrator & System Matrix"
 authors = ["baiersoft"]
 edition.workspace = true

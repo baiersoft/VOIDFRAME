@@ -1,7 +1,8 @@
 //! Real power-plan enumeration/activation via `powercfg.exe`. Output format
 //! confirmed live (`powercfg /list`) during this plan's pre-writing
-//! verification — one `Power Scheme GUID: <guid>  (<name>)` line per plan,
-//! a trailing ` *` on the active one.
+//! verification — one `<label>: <guid>  (<name>)` line per plan, a trailing
+//! ` *` on the active one. The label is localized by Windows (`Power Scheme
+//! GUID:` / `GUID des Energieschemas:` / …), so parsing keys on the GUID.
 
 use crate::error::{Error, Result};
 use crate::system::PowerPlan;
@@ -30,17 +31,29 @@ async fn run_powercfg(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Parses every `Power Scheme GUID: <guid>  (<name>)[ *]` line out of a
+/// `true` for the `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` shape powercfg
+/// prints (lowercase hex, four hyphens at fixed offsets).
+fn is_guid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// Parses every `<label>: <guid>  (<name>)[ *]` line out of a
 /// `powercfg /list` (or `/duplicatescheme`) block.
+///
+/// The label (`Power Scheme GUID:` on an English system, `GUID des
+/// Energieschemas:` on a German one, …) is localized by Windows, so it is
+/// never matched. The locale-independent shape is the GUID token directly
+/// before the first `(`; header/separator lines have no such token.
 fn parse_plans(list_output: &str) -> Vec<PowerPlan> {
     let mut plans = Vec::new();
     for line in list_output.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("Power Scheme GUID: ") else {
-            continue;
-        };
-        let active = rest.trim_end().ends_with('*');
-        let rest = rest.trim_end().trim_end_matches('*').trim_end();
+        let active = line.ends_with('*');
+        let rest = line.trim_end_matches('*').trim_end();
         let Some(open) = rest.find('(') else { continue };
         let Some(close) = rest.rfind(')') else {
             continue;
@@ -48,9 +61,18 @@ fn parse_plans(list_output: &str) -> Vec<PowerPlan> {
         if close <= open {
             continue;
         }
-        let guid = rest[..open].trim().to_string();
+        let Some(guid) = rest[..open].split_whitespace().last() else {
+            continue;
+        };
+        if !is_guid(guid) {
+            continue;
+        }
         let name = rest[open + 1..close].to_string();
-        plans.push(PowerPlan { guid, name, active });
+        plans.push(PowerPlan {
+            guid: guid.to_string(),
+            name,
+            active,
+        });
     }
     plans
 }
@@ -111,6 +133,22 @@ mod tests {
         let balanced = plans.iter().find(|p| p.name == "Balanced").unwrap();
         assert!(!balanced.active);
         assert_eq!(balanced.guid, "381b4222-f694-41f0-9685-ff5bb260df2e");
+    }
+
+    // Reported verbatim by a German-locale user during the first public
+    // alpha: Windows localizes the `Power Scheme GUID:` label, so a parser
+    // keyed on the English text sees zero plans and no active scheme.
+    const SAMPLE_LIST_DE: &str = "GUID des Energieschemas: 381b4222-f694-41f0-9685-ff5bb260df2e  (Ausbalanciert)\r\nGUID des Energieschemas: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (Höchstleistung)\r\nGUID des Energieschemas: 9cd3da5d-51e2-4c17-a827-25edaab949fd  (HITECH) *\r\nGUID des Energieschemas: a1841308-3541-4fab-bc81-f71556f20b4a  (Energiesparmodus)\r\n";
+
+    #[test]
+    fn parses_german_locale_output_reported_from_the_alpha() {
+        let plans = parse_plans(SAMPLE_LIST_DE);
+        assert_eq!(plans.len(), 4);
+        assert_eq!(plans.iter().filter(|p| p.active).count(), 1);
+        let active = plans.iter().find(|p| p.active).unwrap();
+        assert_eq!(active.guid, "9cd3da5d-51e2-4c17-a827-25edaab949fd");
+        assert_eq!(active.name, "HITECH");
+        assert_eq!(plans[1].name, "Höchstleistung");
     }
 
     #[test]
