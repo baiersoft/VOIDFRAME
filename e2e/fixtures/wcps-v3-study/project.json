@@ -1,0 +1,85 @@
+{
+  "schema_version": "2.0.0",
+  "id": "proj_1788477723915",
+  "name": "WCPS v3 Matrix Study",
+  "description": "Real PresentMon captures from the WCPS v3 calibration study (study/real-runs/9b700bea-wcps-v3-matrix-pruned), reprocessed through the current scoring pipeline for UI testing.",
+  "created_at": "2026-09-04T23:44:57Z",
+  "settings": {
+    "schema_version": "2.0.0",
+    "measure_loops": 5,
+    "warmup_loops": 2,
+    "capture_seconds": 105,
+    "map_id": "3240880604",
+    "watchdog_seconds": 120,
+    "netcon_port": null
+  },
+  "baseline": {
+    "name": "Stock System Baseline",
+    "description": "No modules applied."
+  },
+  "scenarios": [
+    {
+      "id": "scen_control_1",
+      "name": "Control 1 (No-Op)",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_1788477728508",
+      "name": "Power Saver #1",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_control_2",
+      "name": "Control 2 (No-Op)",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_1788477747487",
+      "name": "Exclude Core 0 #1",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_control_3",
+      "name": "Control 3 (No-Op)",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_1788477760720",
+      "name": "-noreflex #1",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_1788488762212",
+      "name": "-vulkan #1",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_repeat_noreflex",
+      "name": "-noreflex #2",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    },
+    {
+      "id": "scen_repeat_vulkan",
+      "name": "-vulkan #2",
+      "description": "",
+      "enabled": true,
+      "modules": []
+    }
+  ]
+}

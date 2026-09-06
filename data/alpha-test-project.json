@@ -1,0 +1,23 @@
+{
+  "schema_version": "0.0.0-placeholder",
+  "id": "alpha-test-exclude-core0",
+  "name": "Alpha Test — Exclude Core 0",
+  "description": "A ready-to-run starter for the VOIDFRAME alpha: one scenario testing the Exclude Core 0 CPU affinity tweak against a stock baseline. Confirm the run pipeline works on your machine before building your own scenarios.",
+  "created_at": "2026-09-05T00:00:00Z",
+  "settings": {},
+  "baseline": {
+    "name": "Stock",
+    "description": "No tweaks applied -- CS2 launched with your existing settings."
+  },
+  "scenarios": [
+    {
+      "id": "exclude-core0",
+      "name": "Exclude Core 0",
+      "description": "Excludes physical core 0 (and its SMT sibling) from cs2.exe's affinity mask.",
+      "enabled": true,
+      "modules": [
+        {"type": "affinity_cpu", "mode": "exclude_core0"}
+      ]
+    }
+  ]
+}

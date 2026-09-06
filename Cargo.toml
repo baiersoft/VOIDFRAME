@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = ["crates/voidframe-engine", "crates/voidframe-cli", "src-tauri"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"        # matches rust-toolchain.toml; MSRV-aware resolver stays on latest deps
+repository = "https://github.com/baiersoft/VOIDFRAME"
+
+[workspace.dependencies]
+csv = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip`: without it, serde_json's default float parser is only
+# approximate and can be off by 1 ULP for some values (confirmed live: a
+# `results.json` round-trip test failed on a genuine, if tiny, aggregated-
+# mean/`wcps` mismatch after save+load). This feature makes parsing
+# correctly-rounded, matching the exact-round-trip guarantee `RunResults`'s
+# own persistence layer already claims.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time", "io-util", "process"] }
+async-trait = "0.1"
+thiserror = "2"
+tracing = { version = "0.1", features = ["log"] }
+uuid = { version = "1", features = ["v4"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+dirs = "6"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

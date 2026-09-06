@@ -1,0 +1,20 @@
+HWiNFO64 — Third-Party Notice (not an open-source license)
+
+Bundled binary: hwinfo64-x86_64-pc-windows-msvc.exe
+Bundled config: src-tauri/resources/hwinfo/HWiNFO64.ini
+
+HWiNFO64 is proprietary software developed by Martin Malík / REALiX (https://www.hwinfo.com/).
+It is not open-source and is not distributed under an MIT/BSD/Apache-style license — HWiNFO's
+own site is the authoritative source for its actual terms of use
+(see https://www.hwinfo.com/licenses/).
+
+This copy is bundled with VOIDFRAME under a direct redistribution permission granted by the
+author to this project. No formal license file was provided by HWiNFO's official download for
+inclusion here, so none is reproduced in this repository. This notice exists to record that the
+inclusion is under that granted permission, not under an open-source license — it is not itself
+a substitute for the actual permission terms, which the project owner should keep on file
+separately (in writing, if not already).
+
+If you are evaluating this project for redistribution or a fork, do not assume this permission
+extends to you — contact HWiNFO's author directly for your own arrangement before bundling this
+binary elsewhere.

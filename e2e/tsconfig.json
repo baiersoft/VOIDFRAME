@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "types": ["node", "webdriverio", "@wdio/globals/types", "@wdio/mocha-framework", "@wdio/tauri-service"],
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true
+  },
+  "include": ["wdio.conf.ts", "helpers.ts", "specs/**/*.ts"]
+}

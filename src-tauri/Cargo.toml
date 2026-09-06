@@ -1,0 +1,94 @@
+[package]
+name = "voidframe"
+version = "0.1.0"
+description = "baiersoft // VOIDFRAME — Autonomous CS2 Benchmark Orchestrator & System Matrix"
+authors = ["baiersoft"]
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+name = "voidframe_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# `build.rs` embeds a `requireAdministrator` manifest into EVERY binary this
+# package produces — including the implicit test harness Cargo builds for
+# `src/main.rs`. That harness then cannot even start in a non-elevated
+# `cargo test` run ("The requested operation requires elevation.", os error
+# 740), failing the whole `-p voidframe` test invocation even though
+# `main.rs` contains no tests at all (it is a two-line shim over
+# `voidframe_lib::run()`). `test = false` stops Cargo building/running that
+# empty harness; every real test in this package lives in the `voidframe_lib`
+# lib target, which is unaffected.
+[[bin]]
+name = "voidframe"
+path = "src/main.rs"
+test = false
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+anyhow = "1"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = ["specta"] }
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+voidframe-engine = { path = "../crates/voidframe-engine", features = ["specta"] }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
+uuid = { workspace = true }
+specta = { version = "2.0.0-rc.25", features = ["derive", "function"] }
+specta-typescript = "0.0.12"
+tauri-specta = { version = "2.0.0-rc.25", features = ["typescript"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Threading", "Win32_System_Wmi", "Win32_System_Rpc"] }
+
+[dependencies.tauri-plugin-wdio-webdriver]
+version = "1"
+optional = true
+
+# Companion plugin: `tauri-plugin-wdio-webdriver` alone only runs the
+# embedded WebDriver HTTP server -- it does NOT inject the frontend-side
+# bridge (`window.__wdio_original_core__`, wrapping the real
+# `core.invoke`) that `browser.tauri.execute()` and the service's own
+# per-command window-focus check (`ensureActiveWindowFocus` ->
+# `DirectEvalClient`) both poll for. Without this plugin registered too,
+# every single WebdriverIO command (click/$/$$/findElement) eats a full,
+# unconditional 5-second timeout waiting for a bridge that never appears --
+# confirmed empirically (every command in a real run took 5s+ regardless
+# of `withGlobalTauri`). `tauri-plugin-wdio` is what actually installs
+# that bridge.
+[dependencies.tauri-plugin-wdio]
+version = "1"
+optional = true
+
+# `[target.'cfg(debug_assertions)'.dependencies]` looks like it would gate
+# this to debug builds, but Cargo only evaluates the platform-cfg subset
+# there (windows/target_os/etc.) -- `debug_assertions` is a rustc cfg, not
+# a Cargo target cfg, and Cargo silently ignores the condition, shipping
+# the dependency in EVERY profile including release (confirmed via a real
+# build: "warning: ... This value is not supported ... will not work as
+# expected"). An optional dependency behind its own feature, only ever
+# enabled explicitly via `--features webdriver-testing`, is the actual
+# correct mechanism -- a plain `cargo build`/`tauri build`/`tauri:build`
+# release never enables it.
+[features]
+webdriver-testing = ["dep:tauri-plugin-wdio-webdriver", "dep:tauri-plugin-wdio"]
+# Gates `prepare_run`'s `VOIDFRAME_SIMULATE_RUN` env-var check (see
+# commands/run.rs). No new dependency -- `voidframe_engine::mock_harness`,
+# `MockController`, and `MockCaptureRunner` are already unconditionally
+# compiled into voidframe-engine (voidframe-cli's own `--controller mock`
+# dev-harness flag already depends on them being always-present). This
+# feature exists purely to keep the small amount of *branching code* that
+# reads the env var and swaps backends out of a plain `cargo build`/
+# `tauri build`/`tauri:build` release -- never enabled by one.
+mock-run = []
+
+[dev-dependencies]
+tempfile = "3"
+async-trait.workspace = true

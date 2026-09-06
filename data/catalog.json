@@ -1,0 +1,58 @@
+[
+  {
+    "id": "core-parking-disable",
+    "name": "Disable Core Parking",
+    "category": "cpu",
+    "kind": "powercfg",
+    "description": "Sets CPMINCORES to 100% on the active power scheme so Windows never parks a core mid-benchmark.",
+    "available_in": "M1",
+    "module_template": {"type": "powercfg", "sub": "sub_processor", "setting": "CPMINCORES", "value": 100}
+  },
+  {
+    "id": "cpu-idle-disable",
+    "name": "Disable CPU Idle States",
+    "category": "cpu",
+    "kind": "powercfg",
+    "description": "Sets IDLEDISABLE on the active power scheme, preventing C-state transitions during measurement.",
+    "available_in": "M1",
+    "module_template": {"type": "powercfg", "sub": "sub_processor", "setting": "IDLEDISABLE", "value": 1}
+  },
+  {
+    "id": "power-plan",
+    "name": "Power Plan",
+    "category": "cpu",
+    "kind": "power_plan",
+    "description": "Switches the active Windows power plan for this scenario. The target plan is chosen from the plans installed on your system when this tweak is added.",
+    "available_in": "M1",
+    "singleton": true,
+    "module_template": {"type": "power_plan", "plan_guid": "", "create_if_missing": false}
+  },
+  {
+    "id": "affinity-pcore-only",
+    "name": "P-Core Only Affinity",
+    "category": "cpu",
+    "kind": "affinity_cpu",
+    "description": "Pins cs2.exe to performance cores only (hybrid Intel CPUs), excluding E-cores.",
+    "available_in": "M1",
+    "module_template": {"type": "affinity_cpu", "mode": "pcore_only"}
+  },
+  {
+    "id": "affinity-exclude-core0",
+    "name": "Exclude Core 0",
+    "category": "cpu",
+    "kind": "affinity_cpu",
+    "description": "Excludes physical core 0 (and its SMT sibling) from cs2.exe's affinity mask.",
+    "available_in": "M1",
+    "module_template": {"type": "affinity_cpu", "mode": "exclude_core0"}
+  },
+  {
+    "id": "launch-options",
+    "name": "Launch Options",
+    "category": "cs2_launch",
+    "kind": "launch_args",
+    "description": "Edits CS2's launch options for this scenario. Pre-filled with your current launch options when added -- VOIDFRAME only ever adds its own required options on top, it never overwrites what you set.",
+    "available_in": "M1",
+    "singleton": true,
+    "module_template": {"type": "launch_args", "args": ""}
+  }
+]

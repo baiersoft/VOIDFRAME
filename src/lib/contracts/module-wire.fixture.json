@@ -1,0 +1,34 @@
+[
+  {
+    "type": "registry",
+    "hive": "HKLM",
+    "subkey": "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+    "value_name": "HwSchMode",
+    "value_type": "DWORD",
+    "value": 2
+  },
+  {
+    "type": "powercfg",
+    "sub": "sub_processor",
+    "setting": "IDLEDISABLE",
+    "value": 1
+  },
+  {
+    "type": "power_plan",
+    "plan_guid": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+    "friendly_name": "High performance",
+    "create_if_missing": false
+  },
+  {
+    "type": "affinity_cpu",
+    "mode": "exclude_core0",
+    "mask_hex": null
+  },
+  {
+    "type": "launch_args",
+    "args": "-novid -high"
+  },
+  {
+    "type": "unsupported"
+  }
+]

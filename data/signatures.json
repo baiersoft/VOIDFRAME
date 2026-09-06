@@ -1,0 +1,7 @@
+{
+  "map_loaded": "Loading map \"(?P<map>[^\"]+)\" \\(addon '(?P<addon>\\d+)'\\)",
+  "benchmark_started": "\\[Server\\] BeginMatch",
+  "benchmark_ended": "\\[Client\\] Disconnected from server:",
+  "vprof_fps": "\\[VProf\\] FPS: Avg=(?P<avg>[\\d.]+), P1=(?P<p1>[\\d.]+)",
+  "menu_ready": "\\[SteamNetSockets\\] SDR RelayNetworkStatus:"
+}

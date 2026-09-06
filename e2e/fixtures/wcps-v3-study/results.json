@@ -1,0 +1,1414 @@
+{
+  "schema_version": "2.0.0",
+  "run_id": "9b700bea-b931-4b06-a0b3-7eed9b7d4a8f",
+  "project_id": "proj_1788477723915",
+  "completed_at": "2026-09-04T23:44:57Z",
+  "detection_tier": "log_tail",
+  "baseline": {
+    "scenario_id": "baseline",
+    "name": "Stock System Baseline",
+    "is_baseline": true,
+    "aggregated": {
+      "avg_fps": 880.201054555956,
+      "median_fps": 1021.1796821511683,
+      "p1_fps": 338.06836868896227,
+      "p01_fps": 298.1946598861597,
+      "frame_time_mean_ms": 1.1361077346522648,
+      "frame_time_stddev_ms": 0.46886634936039195,
+      "frame_time_cv": 0.4126934780066788,
+      "adaptive_frame_time_cv": 0.3778084902855074,
+      "stutter_count_pct": 6.478461359996489,
+      "mean_abs_animation_error_ms": 0.17393195440931758,
+      "gpu_busy_ms": 1.061315215038542,
+      "bottleneck_ratio": 0.9341673961589525,
+      "render_latency_ms": 1.5331250625397477,
+      "dominant_present_mode": "Hardware: Independent Flip",
+      "present_mode_consistent": true,
+      "present_mode_warning": null
+    },
+    "per_iteration": [
+      {
+        "avg_fps": 878.6864788562801,
+        "median_fps": 1021.659174499387,
+        "p1_fps": 337.29793324064366,
+        "p01_fps": 298.65520340390253,
+        "frame_time_mean_ms": 1.1380623510920806,
+        "frame_time_stddev_ms": 0.4721252681515712,
+        "frame_time_cv": 0.4148500894511811,
+        "adaptive_frame_time_cv": 0.3789038484316268,
+        "stutter_count_pct": 6.534063194406807,
+        "mean_abs_animation_error_ms": 0.17319458776854876,
+        "gpu_busy_ms": 1.0637027131320926,
+        "bottleneck_ratio": 0.9346611915519103,
+        "render_latency_ms": 1.5442360175600238,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      {
+        "avg_fps": 879.9247537611512,
+        "median_fps": 1022.1813349688235,
+        "p1_fps": 336.22124972093627,
+        "p01_fps": 294.2673425869804,
+        "frame_time_mean_ms": 1.1364608118201005,
+        "frame_time_stddev_ms": 0.4709378571012938,
+        "frame_time_cv": 0.4143898779466602,
+        "adaptive_frame_time_cv": 0.38036194352870667,
+        "stutter_count_pct": 6.550846998971695,
+        "mean_abs_animation_error_ms": 0.17638014374783223,
+        "gpu_busy_ms": 1.0604472944742098,
+        "bottleneck_ratio": 0.9331138244668982,
+        "render_latency_ms": 1.5280793072468306,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      {
+        "avg_fps": 879.0659811049844,
+        "median_fps": 1020.4081632653061,
+        "p1_fps": 340.71596690421376,
+        "p01_fps": 297.7349515823402,
+        "frame_time_mean_ms": 1.1375710373219103,
+        "frame_time_stddev_ms": 0.46744961521480244,
+        "frame_time_cv": 0.4109190546159478,
+        "adaptive_frame_time_cv": 0.37383941248449615,
+        "stutter_count_pct": 6.306267266128596,
+        "mean_abs_animation_error_ms": 0.17274969448777505,
+        "gpu_busy_ms": 1.0633041265370144,
+        "bottleneck_ratio": 0.9347144852072391,
+        "render_latency_ms": 1.536731253994903,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      {
+        "avg_fps": 883.1776741095193,
+        "median_fps": 1020.6164523372116,
+        "p1_fps": 339.1117983776899,
+        "p01_fps": 299.82094693049106,
+        "frame_time_mean_ms": 1.1322749989216712,
+        "frame_time_stddev_ms": 0.4648416612058485,
+        "frame_time_cv": 0.41053777717298645,
+        "adaptive_frame_time_cv": 0.3773202144602223,
+        "stutter_count_pct": 6.490467563837129,
+        "mean_abs_animation_error_ms": 0.17377357955463907,
+        "gpu_busy_ms": 1.0575426501035148,
+        "bottleneck_ratio": 0.9339980579900393,
+        "render_latency_ms": 1.5220917151915305,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      {
+        "avg_fps": 880.1503849478452,
+        "median_fps": 1021.0332856851132,
+        "p1_fps": 336.9948952013277,
+        "p01_fps": 300.4948549270839,
+        "frame_time_mean_ms": 1.1361694741055606,
+        "frame_time_stddev_ms": 0.4689773451284437,
+        "frame_time_cv": 0.41277059084661816,
+        "adaptive_frame_time_cv": 0.37861703252248524,
+        "stutter_count_pct": 6.510661776638214,
+        "mean_abs_animation_error_ms": 0.17356176648779273,
+        "gpu_busy_ms": 1.0615792909458786,
+        "bottleneck_ratio": 0.9343494215786756,
+        "render_latency_ms": 1.5344870187054496,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      }
+    ],
+    "metric_deltas": [],
+    "wcps": 0.0,
+    "verdict": "confirmed_same"
+  },
+  "scenarios": [
+    {
+      "scenario_id": "scen_control_1",
+      "name": "Control 1 (No-Op)",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 875.1715851693895,
+        "median_fps": 1015.0023421360349,
+        "p1_fps": 336.2515390010983,
+        "p01_fps": 296.13829638063146,
+        "frame_time_mean_ms": 1.1426379644624116,
+        "frame_time_stddev_ms": 0.4725670345782297,
+        "frame_time_cv": 0.4135722223924329,
+        "adaptive_frame_time_cv": 0.37813507906487287,
+        "stutter_count_pct": 6.5065224282892276,
+        "mean_abs_animation_error_ms": 0.174214952223956,
+        "gpu_busy_ms": 1.068143143642723,
+        "bottleneck_ratio": 0.9348044953408566,
+        "render_latency_ms": 1.5472625113263054,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 873.2849756706854,
+          "median_fps": 1015.1253679829459,
+          "p1_fps": 337.0849767630471,
+          "p01_fps": 297.67398441599164,
+          "frame_time_mean_ms": 1.1451015737812242,
+          "frame_time_stddev_ms": 0.474887968669744,
+          "frame_time_cv": 0.4147125281660586,
+          "adaptive_frame_time_cv": 0.3764608081565797,
+          "stutter_count_pct": 6.5110699094775875,
+          "mean_abs_animation_error_ms": 0.17330758869656834,
+          "gpu_busy_ms": 1.0710290642381939,
+          "bottleneck_ratio": 0.9353135903058482,
+          "render_latency_ms": 1.552421483258806,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 877.5895323689864,
+          "median_fps": 1016.260162601626,
+          "p1_fps": 337.0227210607858,
+          "p01_fps": 294.524220420156,
+          "frame_time_mean_ms": 1.1394848766035026,
+          "frame_time_stddev_ms": 0.4696641955371571,
+          "frame_time_cv": 0.4121723817319099,
+          "adaptive_frame_time_cv": 0.3778832107952628,
+          "stutter_count_pct": 6.518200169303901,
+          "mean_abs_animation_error_ms": 0.1727172691852646,
+          "gpu_busy_ms": 1.065826258383793,
+          "bottleneck_ratio": 0.9353579676816193,
+          "render_latency_ms": 1.5495577109244467,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 875.1311671597039,
+          "median_fps": 1013.8902970698571,
+          "p1_fps": 334.02855810560413,
+          "p01_fps": 293.08952349153503,
+          "frame_time_mean_ms": 1.1426858481632716,
+          "frame_time_stddev_ms": 0.4733523746103218,
+          "frame_time_cv": 0.4142454160705483,
+          "adaptive_frame_time_cv": 0.380690379346614,
+          "stutter_count_pct": 6.522993197278912,
+          "mean_abs_animation_error_ms": 0.17725736116855328,
+          "gpu_busy_ms": 1.0666649469387877,
+          "bottleneck_ratio": 0.9334717399828848,
+          "render_latency_ms": 1.5394636473469363,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 873.0740659959619,
+          "median_fps": 1015.2284263959391,
+          "p1_fps": 334.64827796689127,
+          "p01_fps": 295.6950584388052,
+          "frame_time_mean_ms": 1.145378197506356,
+          "frame_time_stddev_ms": 0.47616724391206944,
+          "frame_time_cv": 0.41572927173640134,
+          "adaptive_frame_time_cv": 0.37926038422436986,
+          "stutter_count_pct": 6.5264581719808445,
+          "mean_abs_animation_error_ms": 0.17406521729644317,
+          "gpu_busy_ms": 1.071015091684582,
+          "bottleneck_ratio": 0.9350755008400958,
+          "render_latency_ms": 1.555672063748327,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 876.7781846516099,
+          "median_fps": 1014.5074566298063,
+          "p1_fps": 338.47316110916313,
+          "p01_fps": 299.7086951366693,
+          "frame_time_mean_ms": 1.1405393262577042,
+          "frame_time_stddev_ms": 0.46876339016185603,
+          "frame_time_cv": 0.4110015142572464,
+          "adaptive_frame_time_cv": 0.37638061280153806,
+          "stutter_count_pct": 6.453890693404887,
+          "mean_abs_animation_error_ms": 0.17372732477295055,
+          "gpu_busy_ms": 1.0661803569682582,
+          "bottleneck_ratio": 0.9348036778938348,
+          "render_latency_ms": 1.5391976513530112,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": -0.571400063716561
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": -0.5374148711131035
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": -0.6896044034837084
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": 0.08644294338612576
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": 0.4331440249996937
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": 0.16270605111032954
+        }
+      ],
+      "wcps": -0.9953801534151285,
+      "verdict": "confirmed_same"
+    },
+    {
+      "scenario_id": "scen_1788477728508",
+      "name": "Power Saver #1",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 860.5247442423586,
+        "median_fps": 988.3109394759618,
+        "p1_fps": 334.8775278486511,
+        "p01_fps": 295.47291211916297,
+        "frame_time_mean_ms": 1.1620885561729821,
+        "frame_time_stddev_ms": 0.47575872035723643,
+        "frame_time_cv": 0.40940017928544725,
+        "adaptive_frame_time_cv": 0.3759230653640462,
+        "stutter_count_pct": 6.308022829365563,
+        "mean_abs_animation_error_ms": 0.19907415133707457,
+        "gpu_busy_ms": 1.0742460144632733,
+        "bottleneck_ratio": 0.9244101564143579,
+        "render_latency_ms": 1.537295804767036,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 864.2196335330975,
+          "median_fps": 989.9519873286147,
+          "p1_fps": 335.8183894150044,
+          "p01_fps": 299.45370062487524,
+          "frame_time_mean_ms": 1.1571132628771763,
+          "frame_time_stddev_ms": 0.4747691019503166,
+          "frame_time_cv": 0.41030477930034037,
+          "adaptive_frame_time_cv": 0.37970900014786296,
+          "stutter_count_pct": 6.367503471380397,
+          "mean_abs_animation_error_ms": 0.19853342480245442,
+          "gpu_busy_ms": 1.0700096283969989,
+          "bottleneck_ratio": 0.9247233289301402,
+          "render_latency_ms": 1.5385943532212283,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 858.447631138789,
+          "median_fps": 988.4353069091627,
+          "p1_fps": 335.167369177473,
+          "p01_fps": 295.6993603313155,
+          "frame_time_mean_ms": 1.1648934235783635,
+          "frame_time_stddev_ms": 0.47851680246457384,
+          "frame_time_cv": 0.4107816155358212,
+          "adaptive_frame_time_cv": 0.37440156503573313,
+          "stutter_count_pct": 6.2557558945908465,
+          "mean_abs_animation_error_ms": 0.19788498735075857,
+          "gpu_busy_ms": 1.0778981570041504,
+          "bottleneck_ratio": 0.9253191194890793,
+          "render_latency_ms": 1.5450245414701722,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 861.1845988826053,
+          "median_fps": 987.6543209876544,
+          "p1_fps": 332.99944588892185,
+          "p01_fps": 293.8108653079613,
+          "frame_time_mean_ms": 1.1611912257807546,
+          "frame_time_stddev_ms": 0.47492072736928,
+          "frame_time_cv": 0.40899441610054854,
+          "adaptive_frame_time_cv": 0.3772980477939252,
+          "stutter_count_pct": 6.34123683977705,
+          "mean_abs_animation_error_ms": 0.2001454663083482,
+          "gpu_busy_ms": 1.0729256480580216,
+          "bottleneck_ratio": 0.9239870438537068,
+          "render_latency_ms": 1.5321814086968029,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 860.1284494608907,
+          "median_fps": 989.9029895070283,
+          "p1_fps": 335.46003815522477,
+          "p01_fps": 294.5253134051204,
+          "frame_time_mean_ms": 1.1626170493799823,
+          "frame_time_stddev_ms": 0.4746331282225864,
+          "frame_time_cv": 0.40824545664086537,
+          "adaptive_frame_time_cv": 0.3736876784645638,
+          "stutter_count_pct": 6.257750221434899,
+          "mean_abs_animation_error_ms": 0.19616372302615917,
+          "gpu_busy_ms": 1.0756541751550017,
+          "bottleneck_ratio": 0.925200757832205,
+          "render_latency_ms": 1.5372963230735153,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 858.6434081964102,
+          "median_fps": 985.6100926473488,
+          "p1_fps": 334.9423966066316,
+          "p01_fps": 293.8753209265423,
+          "frame_time_mean_ms": 1.1646278192486341,
+          "frame_time_stddev_ms": 0.4759538417794252,
+          "frame_time_cv": 0.4086746288496606,
+          "adaptive_frame_time_cv": 0.374519035378146,
+          "stutter_count_pct": 6.31786771964462,
+          "mean_abs_animation_error_ms": 0.20264315519765247,
+          "gpu_busy_ms": 1.0747424637021934,
+          "bottleneck_ratio": 0.922820531966658,
+          "render_latency_ms": 1.5333823973734613,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": -2.2354336218699236
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": -0.9438448360860687
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": -0.9127419545459943
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": -0.4990424963812768
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": -2.6308489185928883
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": 14.455191406973642
+        }
+      ],
+      "wcps": -4.092148215740865,
+      "verdict": "worse"
+    },
+    {
+      "scenario_id": "scen_control_2",
+      "name": "Control 2 (No-Op)",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 876.2934763062916,
+        "median_fps": 1015.7861234935147,
+        "p1_fps": 336.2674870090614,
+        "p01_fps": 294.8727444414248,
+        "frame_time_mean_ms": 1.141171716488898,
+        "frame_time_stddev_ms": 0.47154166691931143,
+        "frame_time_cv": 0.4132078033474989,
+        "adaptive_frame_time_cv": 0.3781281074756635,
+        "stutter_count_pct": 6.45817297640931,
+        "mean_abs_animation_error_ms": 0.17335959541245058,
+        "gpu_busy_ms": 1.0671936182057251,
+        "bottleneck_ratio": 0.9351737452505151,
+        "render_latency_ms": 1.5461124760974025,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 877.2205636101694,
+          "median_fps": 1016.6734444896299,
+          "p1_fps": 336.2783470036087,
+          "p01_fps": 293.850044737199,
+          "frame_time_mean_ms": 1.1399641566592287,
+          "frame_time_stddev_ms": 0.47247668950483523,
+          "frame_time_cv": 0.41446626786009855,
+          "adaptive_frame_time_cv": 0.3791620986787346,
+          "stutter_count_pct": 6.503941453668918,
+          "mean_abs_animation_error_ms": 0.17303635188985186,
+          "gpu_busy_ms": 1.0662161708180486,
+          "bottleneck_ratio": 0.9353067502952853,
+          "render_latency_ms": 1.5458608254251172,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 875.1837986924473,
+          "median_fps": 1016.053647632595,
+          "p1_fps": 334.8733040341516,
+          "p01_fps": 293.1923148664978,
+          "frame_time_mean_ms": 1.142617129674969,
+          "frame_time_stddev_ms": 0.4740324881933998,
+          "frame_time_cv": 0.41486555372073236,
+          "adaptive_frame_time_cv": 0.3799625322417858,
+          "stutter_count_pct": 6.511496316608451,
+          "mean_abs_animation_error_ms": 0.17480811551937483,
+          "gpu_busy_ms": 1.0679767853839541,
+          "bottleneck_ratio": 0.9346759799476775,
+          "render_latency_ms": 1.5463592237129704,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 876.6684946117795,
+          "median_fps": 1016.7768174885612,
+          "p1_fps": 335.60887336436826,
+          "p01_fps": 295.72334655088446,
+          "frame_time_mean_ms": 1.140682032200594,
+          "frame_time_stddev_ms": 0.47203682413530057,
+          "frame_time_cv": 0.4138198120160192,
+          "adaptive_frame_time_cv": 0.37954223073615867,
+          "stutter_count_pct": 6.49443768468625,
+          "mean_abs_animation_error_ms": 0.1746761415363837,
+          "gpu_busy_ms": 1.0659773900573668,
+          "bottleneck_ratio": 0.9345087938317854,
+          "render_latency_ms": 1.5445269261689714,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 877.3924270386377,
+          "median_fps": 1014.8163182463974,
+          "p1_fps": 337.609723160027,
+          "p01_fps": 294.5256170134933,
+          "frame_time_mean_ms": 1.1397408607402568,
+          "frame_time_stddev_ms": 0.4678735818510616,
+          "frame_time_cv": 0.41050873752756367,
+          "adaptive_frame_time_cv": 0.37647836405324336,
+          "stutter_count_pct": 6.407250624118094,
+          "mean_abs_animation_error_ms": 0.1715325174483548,
+          "gpu_busy_ms": 1.066671161402373,
+          "bottleneck_ratio": 0.9358891991549505,
+          "render_latency_ms": 1.5454775426028384,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 875.0020975784242,
+          "median_fps": 1014.6103896103896,
+          "p1_fps": 336.9671874831515,
+          "p01_fps": 297.0723990390495,
+          "frame_time_mean_ms": 1.142854403169442,
+          "frame_time_stddev_ms": 0.4712887509119601,
+          "frame_time_cv": 0.4123786456130806,
+          "adaptive_frame_time_cv": 0.37549531166839506,
+          "stutter_count_pct": 6.373738802964834,
+          "mean_abs_animation_error_ms": 0.17274485066828785,
+          "gpu_busy_ms": 1.0691265833668837,
+          "bottleneck_ratio": 0.9354880030228774,
+          "render_latency_ms": 1.5483378625771158,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": -0.4439415551070569
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": -0.5326974797685761
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": -1.1140090322217961
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": 0.08459767272952885
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": -0.3131666990013469
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": -0.32907064076337383
+        }
+      ],
+      "wcps": -0.7570212010259679,
+      "verdict": "confirmed_same"
+    },
+    {
+      "scenario_id": "scen_1788477747487",
+      "name": "Exclude Core 0 #1",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 907.8831104146957,
+        "median_fps": 1045.976704137564,
+        "p1_fps": 368.8306380279888,
+        "p01_fps": 326.1067714087386,
+        "frame_time_mean_ms": 1.1014648482394445,
+        "frame_time_stddev_ms": 0.4258347290942751,
+        "frame_time_cv": 0.3866058727313918,
+        "adaptive_frame_time_cv": 0.3403557701518056,
+        "stutter_count_pct": 5.022686917279785,
+        "mean_abs_animation_error_ms": 0.11823197341750755,
+        "gpu_busy_ms": 1.052520776586657,
+        "bottleneck_ratio": 0.9555648255728594,
+        "render_latency_ms": 1.6165767796475403,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 907.1190428562778,
+          "median_fps": 1047.559187094071,
+          "p1_fps": 366.8464703500011,
+          "p01_fps": 321.7599289965925,
+          "frame_time_mean_ms": 1.1023911446630694,
+          "frame_time_stddev_ms": 0.4295398961168088,
+          "frame_time_cv": 0.3896438194340646,
+          "adaptive_frame_time_cv": 0.34222068235292524,
+          "stutter_count_pct": 5.100690871674261,
+          "mean_abs_animation_error_ms": 0.11946285003307143,
+          "gpu_busy_ms": 1.0527641943680346,
+          "bottleneck_ratio": 0.9549824483484919,
+          "render_latency_ms": 1.6166678314189273,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 907.6609377620408,
+          "median_fps": 1045.3143782992736,
+          "p1_fps": 367.65814263518246,
+          "p01_fps": 328.16360793571477,
+          "frame_time_mean_ms": 1.101732991248509,
+          "frame_time_stddev_ms": 0.4272168966900573,
+          "frame_time_cv": 0.38776808907748633,
+          "adaptive_frame_time_cv": 0.3426710057402244,
+          "stutter_count_pct": 5.1365191294675645,
+          "mean_abs_animation_error_ms": 0.119339214245987,
+          "gpu_busy_ms": 1.0522034355390242,
+          "bottleneck_ratio": 0.9550439570177918,
+          "render_latency_ms": 1.617150797498383,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 906.4910377144735,
+          "median_fps": 1042.535446205171,
+          "p1_fps": 367.66760495439433,
+          "p01_fps": 325.9135421769898,
+          "frame_time_mean_ms": 1.1031548668382753,
+          "frame_time_stddev_ms": 0.4267790083015784,
+          "frame_time_cv": 0.3868713461100517,
+          "adaptive_frame_time_cv": 0.34053932124516156,
+          "stutter_count_pct": 4.99028208226086,
+          "mean_abs_animation_error_ms": 0.11809780740460445,
+          "gpu_busy_ms": 1.0543570772705788,
+          "bottleneck_ratio": 0.9557652410966062,
+          "render_latency_ms": 1.6220051405158433,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 909.2875199882297,
+          "median_fps": 1049.9790004199915,
+          "p1_fps": 370.7548568886252,
+          "p01_fps": 328.69492207103445,
+          "frame_time_mean_ms": 1.0997621522540466,
+          "frame_time_stddev_ms": 0.4232763115987878,
+          "frame_time_cv": 0.38487986764342696,
+          "adaptive_frame_time_cv": 0.3387082451463698,
+          "stutter_count_pct": 4.97737556561086,
+          "mean_abs_animation_error_ms": 0.11787018256852946,
+          "gpu_busy_ms": 1.0509734791352563,
+          "bottleneck_ratio": 0.9556370684162987,
+          "render_latency_ms": 1.6119916771409295,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 908.8570137524563,
+          "median_fps": 1044.4955086693126,
+          "p1_fps": 371.2261153117409,
+          "p01_fps": 326.00185586336147,
+          "frame_time_mean_ms": 1.100283086193323,
+          "frame_time_stddev_ms": 0.422361532764143,
+          "frame_time_cv": 0.3838662413919292,
+          "adaptive_frame_time_cv": 0.337639596274347,
+          "stutter_count_pct": 4.908566937385381,
+          "mean_abs_animation_error_ms": 0.1163898128353454,
+          "gpu_busy_ms": 1.0523056966203923,
+          "bottleneck_ratio": 0.9563954129851079,
+          "render_latency_ms": 1.6150684516636187,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": 3.144969631137821
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": 9.099422539388529
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": 9.360365988188654
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": -9.913149412126495
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": -22.470990592085478
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": -32.02400684852316
+        }
+      ],
+      "wcps": 17.39852624314305,
+      "verdict": "better"
+    },
+    {
+      "scenario_id": "scen_control_3",
+      "name": "Control 3 (No-Op)",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 878.7479451730973,
+        "median_fps": 1018.4132408137605,
+        "p1_fps": 336.630311245072,
+        "p01_fps": 296.8402389907068,
+        "frame_time_mean_ms": 1.1379835203136512,
+        "frame_time_stddev_ms": 0.4716816956065143,
+        "frame_time_cv": 0.41448880054721016,
+        "adaptive_frame_time_cv": 0.3804451481667087,
+        "stutter_count_pct": 6.527855163362338,
+        "mean_abs_animation_error_ms": 0.17587787159461005,
+        "gpu_busy_ms": 1.0625131496310734,
+        "bottleneck_ratio": 0.9336804773692405,
+        "render_latency_ms": 1.5327155670159258,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 879.5860851104424,
+          "median_fps": 1019.2640913260626,
+          "p1_fps": 336.1960426363821,
+          "p01_fps": 297.53691503312643,
+          "frame_time_mean_ms": 1.1368983854200447,
+          "frame_time_stddev_ms": 0.47197109670492965,
+          "frame_time_cv": 0.4151392092359711,
+          "adaptive_frame_time_cv": 0.38029560657901096,
+          "stutter_count_pct": 6.578519914235592,
+          "mean_abs_animation_error_ms": 0.1765872889707038,
+          "gpu_busy_ms": 1.0612431886600429,
+          "bottleneck_ratio": 0.9334547416636098,
+          "render_latency_ms": 1.531353282221217,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 879.4006962641856,
+          "median_fps": 1018.5373803218578,
+          "p1_fps": 335.3406826597344,
+          "p01_fps": 297.8590102841988,
+          "frame_time_mean_ms": 1.1371380580526451,
+          "frame_time_stddev_ms": 0.47321755597704457,
+          "frame_time_cv": 0.4161478482106492,
+          "adaptive_frame_time_cv": 0.382431562931524,
+          "stutter_count_pct": 6.6424780678002815,
+          "mean_abs_animation_error_ms": 0.1769820847187713,
+          "gpu_busy_ms": 1.0611644839163819,
+          "bottleneck_ratio": 0.9331887860068914,
+          "render_latency_ms": 1.5314259568937547,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 877.648265855675,
+          "median_fps": 1018.7449062754686,
+          "p1_fps": 337.0521419663622,
+          "p01_fps": 296.4935193928987,
+          "frame_time_mean_ms": 1.1394086206335023,
+          "frame_time_stddev_ms": 0.4757666394817505,
+          "frame_time_cv": 0.41755576609314043,
+          "adaptive_frame_time_cv": 0.38372517842925385,
+          "stutter_count_pct": 6.483923126173346,
+          "mean_abs_animation_error_ms": 0.17563985458490927,
+          "gpu_busy_ms": 1.0639817017720812,
+          "bottleneck_ratio": 0.933801695462437,
+          "render_latency_ms": 1.5362865449099627,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 878.2276434927436,
+          "median_fps": 1017.708121310808,
+          "p1_fps": 335.7554733178482,
+          "p01_fps": 296.1690357524001,
+          "frame_time_mean_ms": 1.1386569386759033,
+          "frame_time_stddev_ms": 0.46951232757405803,
+          "frame_time_cv": 0.41233870503615805,
+          "adaptive_frame_time_cv": 0.3786127739829486,
+          "stutter_count_pct": 6.41652659545627,
+          "mean_abs_animation_error_ms": 0.17565613030558958,
+          "gpu_busy_ms": 1.063185657430994,
+          "bottleneck_ratio": 0.9337190345209051,
+          "render_latency_ms": 1.5318809239277753,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 878.8770351424397,
+          "median_fps": 1017.8117048346055,
+          "p1_fps": 338.80721564503307,
+          "p01_fps": 296.14271449090995,
+          "frame_time_mean_ms": 1.13781559878616,
+          "frame_time_stddev_ms": 0.46794085829478865,
+          "frame_time_cv": 0.41126247416013234,
+          "adaptive_frame_time_cv": 0.37716061891080604,
+          "stutter_count_pct": 6.5178281131462015,
+          "mean_abs_animation_error_ms": 0.1745239993930763,
+          "gpu_busy_ms": 1.0629907163758663,
+          "bottleneck_ratio": 0.9342381291923594,
+          "render_latency_ms": 1.5326311271269195,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": -0.1650883483196728
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": -0.42537473986906726
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": -0.4542069586256087
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": 0.6978821146154804
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": 0.7624310869683959
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": 1.1187807277282131
+        }
+      ],
+      "wcps": -0.8202117862479287,
+      "verdict": "confirmed_same"
+    },
+    {
+      "scenario_id": "scen_1788477760720",
+      "name": "-noreflex #1",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 883.6785232837944,
+        "median_fps": 1022.8314610510706,
+        "p1_fps": 338.73172150235985,
+        "p01_fps": 305.2023520280943,
+        "frame_time_mean_ms": 1.1316348246777777,
+        "frame_time_stddev_ms": 0.4720882628629021,
+        "frame_time_cv": 0.41717354477838137,
+        "adaptive_frame_time_cv": 0.379526301064276,
+        "stutter_count_pct": 6.538435936071663,
+        "mean_abs_animation_error_ms": 0.1691862831465028,
+        "gpu_busy_ms": 1.061864377393892,
+        "bottleneck_ratio": 0.9383452031749675,
+        "render_latency_ms": 1.5622294961547165,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 883.335788488381,
+          "median_fps": 1020.9290454313425,
+          "p1_fps": 338.75338753387535,
+          "p01_fps": 305.57132303582307,
+          "frame_time_mean_ms": 1.1320723251927356,
+          "frame_time_stddev_ms": 0.47210152804618494,
+          "frame_time_cv": 0.4170241755232463,
+          "adaptive_frame_time_cv": 0.380505389324379,
+          "stutter_count_pct": 6.612755404604021,
+          "mean_abs_animation_error_ms": 0.16853561632019168,
+          "gpu_busy_ms": 1.063021733786204,
+          "bottleneck_ratio": 0.9390051413943225,
+          "render_latency_ms": 1.5694735565259916,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 884.3447724846485,
+          "median_fps": 1023.9606799098914,
+          "p1_fps": 338.9802930416838,
+          "p01_fps": 306.163412394513,
+          "frame_time_mean_ms": 1.1307806990144889,
+          "frame_time_stddev_ms": 0.4718136814360398,
+          "frame_time_cv": 0.41724596276469905,
+          "adaptive_frame_time_cv": 0.3799239154707936,
+          "stutter_count_pct": 6.584091765846303,
+          "mean_abs_animation_error_ms": 0.16973535284993632,
+          "gpu_busy_ms": 1.0608107415585166,
+          "bottleneck_ratio": 0.9381224338928377,
+          "render_latency_ms": 1.5623294630836357,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 884.9807233609082,
+          "median_fps": 1023.7510237510237,
+          "p1_fps": 337.4046831770025,
+          "p01_fps": 304.185359363966,
+          "frame_time_mean_ms": 1.1299681152401613,
+          "frame_time_stddev_ms": 0.47127459667035254,
+          "frame_time_cv": 0.4170689334629489,
+          "adaptive_frame_time_cv": 0.3810739864783194,
+          "stutter_count_pct": 6.512123462370452,
+          "mean_abs_animation_error_ms": 0.1693114229750917,
+          "gpu_busy_ms": 1.0599593441599777,
+          "bottleneck_ratio": 0.938043587127851,
+          "render_latency_ms": 1.559215813773294,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 883.8269332667153,
+          "median_fps": 1024.1704219582139,
+          "p1_fps": 340.32867582196246,
+          "p01_fps": 304.83994378751146,
+          "frame_time_mean_ms": 1.1314432298457993,
+          "frame_time_stddev_ms": 0.47187144246468915,
+          "frame_time_cv": 0.4170526898897075,
+          "adaptive_frame_time_cv": 0.37746122587259207,
+          "stutter_count_pct": 6.468959125833809,
+          "mean_abs_animation_error_ms": 0.1693315595499749,
+          "gpu_busy_ms": 1.0613787148291562,
+          "bottleneck_ratio": 0.9380750945620207,
+          "render_latency_ms": 1.554043687834746,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 881.9043988183196,
+          "median_fps": 1021.3461342048821,
+          "p1_fps": 338.191567937275,
+          "p01_fps": 305.2517215586582,
+          "frame_time_mean_ms": 1.1339097540957035,
+          "frame_time_stddev_ms": 0.4733800656972441,
+          "frame_time_cv": 0.41747596225130473,
+          "adaptive_frame_time_cv": 0.3786669881752957,
+          "stutter_count_pct": 6.514249921703727,
+          "mean_abs_animation_error_ms": 0.1690174640373194,
+          "gpu_busy_ms": 1.064151352635606,
+          "bottleneck_ratio": 0.9384797588978057,
+          "render_latency_ms": 1.5660849595559154,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": 0.39507663730222725
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": 0.19621853886244348
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": 2.3500394489324252
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": 0.45467765360975687
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": 0.9257533964084068
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": -2.728464288768177
+        }
+      ],
+      "wcps": 0.8930166683418143,
+      "verdict": "better"
+    },
+    {
+      "scenario_id": "scen_1788488762212",
+      "name": "-vulkan #1",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 549.2676050484226,
+        "median_fps": 736.5861314654293,
+        "p1_fps": 215.1762947679195,
+        "p01_fps": 191.34417865454412,
+        "frame_time_mean_ms": 1.820643442326137,
+        "frame_time_stddev_ms": 0.9468595898002506,
+        "frame_time_cv": 0.5200713241858459,
+        "adaptive_frame_time_cv": 0.4726673387577495,
+        "stutter_count_pct": 5.265763098101365,
+        "mean_abs_animation_error_ms": 1.186115431097535,
+        "gpu_busy_ms": 1.4253463710887833,
+        "bottleneck_ratio": 0.7828839354741264,
+        "render_latency_ms": 2.6484261831356624,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 552.0647142682778,
+          "median_fps": 744.8234768359898,
+          "p1_fps": 215.41310956793947,
+          "p01_fps": 191.88294096757687,
+          "frame_time_mean_ms": 1.8113818437489313,
+          "frame_time_stddev_ms": 0.9437143777329482,
+          "frame_time_cv": 0.5209914082940056,
+          "adaptive_frame_time_cv": 0.47386852179072514,
+          "stutter_count_pct": 5.288312226094758,
+          "mean_abs_animation_error_ms": 1.1824612005452293,
+          "gpu_busy_ms": 1.4162370785741119,
+          "bottleneck_ratio": 0.7818545181191575,
+          "render_latency_ms": 2.6312421011767135,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 552.5381578937188,
+          "median_fps": 750.0468779298706,
+          "p1_fps": 215.27260077071904,
+          "p01_fps": 191.53104863861975,
+          "frame_time_mean_ms": 1.8098297569384354,
+          "frame_time_stddev_ms": 0.9422324613627604,
+          "frame_time_cv": 0.5206193885090442,
+          "adaptive_frame_time_cv": 0.4724303754451031,
+          "stutter_count_pct": 5.25943802792622,
+          "mean_abs_animation_error_ms": 1.1804932734575626,
+          "gpu_busy_ms": 1.4216374487157248,
+          "bottleneck_ratio": 0.7855089371061128,
+          "render_latency_ms": 2.656604375107762,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 547.4586317148497,
+          "median_fps": 730.887297178775,
+          "p1_fps": 215.22501775606395,
+          "p01_fps": 192.40537503655693,
+          "frame_time_mean_ms": 1.826622035107233,
+          "frame_time_stddev_ms": 0.9505094663437554,
+          "frame_time_cv": 0.5203646118765644,
+          "adaptive_frame_time_cv": 0.4730465691476824,
+          "stutter_count_pct": 5.239992345296707,
+          "mean_abs_animation_error_ms": 1.195815029575514,
+          "gpu_busy_ms": 1.4289850385344611,
+          "bottleneck_ratio": 0.7823101939370679,
+          "render_latency_ms": 2.6511619491657834,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 546.9602048780985,
+          "median_fps": 731.9572536963841,
+          "p1_fps": 215.1785207079201,
+          "p01_fps": 190.24977512476318,
+          "frame_time_mean_ms": 1.8282865756620648,
+          "frame_time_stddev_ms": 0.9505036397452303,
+          "frame_time_cv": 0.5198876655324295,
+          "adaptive_frame_time_cv": 0.473047993239735,
+          "stutter_count_pct": 5.2826772064840775,
+          "mean_abs_animation_error_ms": 1.1933445291823386,
+          "gpu_busy_ms": 1.4285941740810781,
+          "bottleneck_ratio": 0.7813841621430444,
+          "render_latency_ms": 2.6468436055926268,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 547.3163164871681,
+          "median_fps": 725.2157516861266,
+          "p1_fps": 214.79222503695502,
+          "p01_fps": 190.6517535052038,
+          "frame_time_mean_ms": 1.827097000174021,
+          "frame_time_stddev_ms": 0.947338003816559,
+          "frame_time_cv": 0.518493546717186,
+          "adaptive_frame_time_cv": 0.4709432341655023,
+          "stutter_count_pct": 5.2583956847050635,
+          "mean_abs_animation_error_ms": 1.1784631227270301,
+          "gpu_busy_ms": 1.43127811553854,
+          "bottleneck_ratio": 0.7833618660652492,
+          "render_latency_ms": 2.6562788846354266,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": -37.59748386969188
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": -36.35124883100461
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": -35.832459666584015
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": 25.107653986430513
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": -18.71892405476632
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": 581.9422199478225
+        }
+      ],
+      "wcps": -131.94528847385408,
+      "verdict": "worse"
+    },
+    {
+      "scenario_id": "scen_repeat_noreflex",
+      "name": "-noreflex #2",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 883.5185057087258,
+        "median_fps": 1024.6544808916403,
+        "p1_fps": 337.3050286814216,
+        "p01_fps": 302.7709630355425,
+        "frame_time_mean_ms": 1.131840887738457,
+        "frame_time_stddev_ms": 0.4777648410189833,
+        "frame_time_cv": 0.4221085835927199,
+        "adaptive_frame_time_cv": 0.38466871770432826,
+        "stutter_count_pct": 6.529876159062131,
+        "mean_abs_animation_error_ms": 0.1709290928780793,
+        "gpu_busy_ms": 1.0611366844262822,
+        "bottleneck_ratio": 0.9375317302601129,
+        "render_latency_ms": 1.5598784829233148,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 881.6130341910749,
+          "median_fps": 1022.3903486351089,
+          "p1_fps": 337.5705184813107,
+          "p01_fps": 303.380753767685,
+          "frame_time_mean_ms": 1.134284500361943,
+          "frame_time_stddev_ms": 0.4846389369817224,
+          "frame_time_cv": 0.4272640037195934,
+          "adaptive_frame_time_cv": 0.3905406770524413,
+          "stutter_count_pct": 6.56460343355986,
+          "mean_abs_animation_error_ms": 0.170745991615883,
+          "gpu_busy_ms": 1.0640365310025133,
+          "bottleneck_ratio": 0.9380684745872715,
+          "render_latency_ms": 1.5686292522445555,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 882.9722937572732,
+          "median_fps": 1025.4306808859722,
+          "p1_fps": 335.173660176811,
+          "p01_fps": 300.24277630892124,
+          "frame_time_mean_ms": 1.1325383673645568,
+          "frame_time_stddev_ms": 0.47748291431321377,
+          "frame_time_cv": 0.4216041840810459,
+          "adaptive_frame_time_cv": 0.38418200969723293,
+          "stutter_count_pct": 6.616401859582133,
+          "mean_abs_animation_error_ms": 0.17238098222375076,
+          "gpu_busy_ms": 1.0612475919274418,
+          "bottleneck_ratio": 0.9370522204885559,
+          "render_latency_ms": 1.561920725064461,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 883.0847844007876,
+          "median_fps": 1025.3255408592229,
+          "p1_fps": 335.9914738803588,
+          "p01_fps": 301.2484912345794,
+          "frame_time_mean_ms": 1.1323941003904223,
+          "frame_time_stddev_ms": 0.4761950152066459,
+          "frame_time_cv": 0.4205205723364907,
+          "adaptive_frame_time_cv": 0.381906139004989,
+          "stutter_count_pct": 6.55536141849479,
+          "mean_abs_animation_error_ms": 0.1712977501429044,
+          "gpu_busy_ms": 1.0614334670721948,
+          "bottleneck_ratio": 0.9373357444252297,
+          "render_latency_ms": 1.5624156873530375,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 885.65865754112,
+          "median_fps": 1024.6951531919253,
+          "p1_fps": 338.6679174801754,
+          "p01_fps": 304.1997667700376,
+          "frame_time_mean_ms": 1.129103172520584,
+          "frame_time_stddev_ms": 0.4695436924258358,
+          "frame_time_cv": 0.41585543629076627,
+          "adaptive_frame_time_cv": 0.3789435605917755,
+          "stutter_count_pct": 6.457961413546125,
+          "mean_abs_animation_error_ms": 0.16888222078829776,
+          "gpu_busy_ms": 1.0592313434280267,
+          "bottleneck_ratio": 0.9381174096459431,
+          "render_latency_ms": 1.5545748661088572,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 884.2637586533729,
+          "median_fps": 1025.4306808859722,
+          "p1_fps": 339.1215733884521,
+          "p01_fps": 304.7830270964893,
+          "frame_time_mean_ms": 1.1308842980547789,
+          "frame_time_stddev_ms": 0.48096364616749887,
+          "frame_time_cv": 0.4252987215357035,
+          "adaptive_frame_time_cv": 0.3877712021752026,
+          "stutter_count_pct": 6.455052670127744,
+          "mean_abs_animation_error_ms": 0.17133851961956068,
+          "gpu_busy_ms": 1.059734488701235,
+          "bottleneck_ratio": 0.9370848021535644,
+          "render_latency_ms": 1.5518518838456634,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": 0.37689697548060214
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": -0.22579456649579505
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": 1.5346697191458318
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": 1.8157949318811324
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": 0.7936266994370136
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": -1.726457649162946
+        }
+      ],
+      "wcps": 0.12217745835695393,
+      "verdict": "better"
+    },
+    {
+      "scenario_id": "scen_repeat_vulkan",
+      "name": "-vulkan #2",
+      "is_baseline": false,
+      "aggregated": {
+        "avg_fps": 551.2967893847217,
+        "median_fps": 741.868728700236,
+        "p1_fps": 215.842828107436,
+        "p01_fps": 191.2768163716441,
+        "frame_time_mean_ms": 1.814008252896518,
+        "frame_time_stddev_ms": 0.9442562105881533,
+        "frame_time_cv": 0.5205525543862807,
+        "adaptive_frame_time_cv": 0.47319109679768145,
+        "stutter_count_pct": 5.273837199899428,
+        "mean_abs_animation_error_ms": 1.1765191734754818,
+        "gpu_busy_ms": 1.418843534433963,
+        "bottleneck_ratio": 0.7821617474150468,
+        "render_latency_ms": 2.6349581838309577,
+        "dominant_present_mode": "Hardware: Independent Flip",
+        "present_mode_consistent": true,
+        "present_mode_warning": null
+      },
+      "per_iteration": [
+        {
+          "avg_fps": 547.1443005619914,
+          "median_fps": 717.4630506528914,
+          "p1_fps": 215.44295070665285,
+          "p01_fps": 191.4159369923049,
+          "frame_time_mean_ms": 1.8276714186236873,
+          "frame_time_stddev_ms": 0.9464152662015068,
+          "frame_time_cv": 0.5178257188670143,
+          "adaptive_frame_time_cv": 0.47176840568750344,
+          "stutter_count_pct": 5.262608150688509,
+          "mean_abs_animation_error_ms": 1.1836845078514149,
+          "gpu_busy_ms": 1.4284940723847923,
+          "bottleneck_ratio": 0.7815923900919279,
+          "render_latency_ms": 2.6521730167296473,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 551.8364336200552,
+          "median_fps": 748.2789583956899,
+          "p1_fps": 215.1583350187403,
+          "p01_fps": 190.58473301937613,
+          "frame_time_mean_ms": 1.8121311661863009,
+          "frame_time_stddev_ms": 0.9444042496710194,
+          "frame_time_cv": 0.5211566730340796,
+          "adaptive_frame_time_cv": 0.4736765952490226,
+          "stutter_count_pct": 5.241538806717178,
+          "mean_abs_animation_error_ms": 1.1745764722126322,
+          "gpu_busy_ms": 1.4181961978564337,
+          "bottleneck_ratio": 0.7826123319986167,
+          "render_latency_ms": 2.631875606220142,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 558.21921969555,
+          "median_fps": 768.5213648939441,
+          "p1_fps": 216.4999833295016,
+          "p01_fps": 191.46999267914418,
+          "frame_time_mean_ms": 1.7914109094011401,
+          "frame_time_stddev_ms": 0.9403142318324245,
+          "frame_time_cv": 0.5249014767621165,
+          "adaptive_frame_time_cv": 0.4749662105800425,
+          "stutter_count_pct": 5.236307797304215,
+          "mean_abs_animation_error_ms": 1.1702889709771418,
+          "gpu_busy_ms": 1.4007152516635262,
+          "bottleneck_ratio": 0.7819061747992695,
+          "render_latency_ms": 2.6097602269237443,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 546.8243300145845,
+          "median_fps": 727.6961141027507,
+          "p1_fps": 215.24262148293565,
+          "p01_fps": 191.33971938575942,
+          "frame_time_mean_ms": 1.8287408681565591,
+          "frame_time_stddev_ms": 0.9495871931886211,
+          "frame_time_cv": 0.5192573807057975,
+          "adaptive_frame_time_cv": 0.47298590049054257,
+          "stutter_count_pct": 5.340626034245502,
+          "mean_abs_animation_error_ms": 1.1851877996098001,
+          "gpu_busy_ms": 1.4286717465902732,
+          "bottleneck_ratio": 0.7812324706399923,
+          "render_latency_ms": 2.644536699820593,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        },
+        {
+          "avg_fps": 552.4596630314279,
+          "median_fps": 747.3841554559043,
+          "p1_fps": 216.87024999934943,
+          "p01_fps": 191.57369978163595,
+          "frame_time_mean_ms": 1.810086902114902,
+          "frame_time_stddev_ms": 0.9405601120471953,
+          "frame_time_cv": 0.5196215225623956,
+          "adaptive_frame_time_cv": 0.4725583719812961,
+          "stutter_count_pct": 5.288105210541738,
+          "mean_abs_animation_error_ms": 1.1688581167264211,
+          "gpu_busy_ms": 1.4181404036747896,
+          "bottleneck_ratio": 0.7834653695454274,
+          "render_latency_ms": 2.6364453694606587,
+          "dominant_present_mode": "Hardware: Independent Flip",
+          "present_mode_consistent": true,
+          "present_mode_warning": null
+        }
+      ],
+      "metric_deltas": [
+        {
+          "metric": "avg_fps",
+          "delta_pct": -37.36694741148202
+        },
+        {
+          "metric": "p1_fps",
+          "delta_pct": -36.15408949838165
+        },
+        {
+          "metric": "p01_fps",
+          "delta_pct": -35.855049703215045
+        },
+        {
+          "metric": "adaptive_frame_time_cv",
+          "delta_pct": 25.246284550168273
+        },
+        {
+          "metric": "stutter_count_pct",
+          "delta_pct": -18.59429412569212
+        },
+        {
+          "metric": "mean_abs_animation_error_ms",
+          "delta_pct": 576.4249717488689
+        }
+      ],
+      "wcps": -131.03286941990055,
+      "verdict": "worse"
+    }
+  ]
+}
