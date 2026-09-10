@@ -22,11 +22,39 @@ pub struct ThresholdPair {
     pub pacing: PercentilePair,
 }
 
+/// A TOST equivalence margin, tagged with the unit its number is in -- the
+/// unit travels with the value (in the JSON as `{"unit": ..., "value": ...}`)
+/// rather than being inferred from the metric's name at evaluation time.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(tag = "unit", content = "value", rename_all = "snake_case")]
+pub enum Margin {
+    /// `value` percent of the baseline mean -- the right shape for a metric
+    /// whose scale varies across rigs (fps, milliseconds).
+    RelativePct(f64),
+    /// `value` absolute units of the metric itself -- the only sound shape
+    /// for a metric that is already a bounded 0-100 percentage
+    /// (`stutter_count_pct`): "percent of baseline" is unstable when the
+    /// reference value can legitimately sit near zero, where an ordinary
+    /// sampling fluctuation divides into a swing of thousands of percent
+    /// (study/research/aveyo-tost-hotelling-fix-research.md Sec 1).
+    AbsolutePoints(f64),
+}
+
+impl Margin {
+    /// The half-width of the equivalence band, in whatever unit the variant
+    /// names; `tost` compares a delta expressed in that same unit against it.
+    pub fn bound(self) -> f64 {
+        match self {
+            Margin::RelativePct(v) | Margin::AbsolutePoints(v) => v,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct CalibratedThresholds {
     pub throughput_metrics: Vec<String>,
     pub pacing_metrics: Vec<String>,
-    pub pacing_tost_margins_pct: BTreeMap<String, f64>,
+    pub pacing_tost_margins: BTreeMap<String, Margin>,
     // Deserialized from the JSON's string-keyed "thresholds" object
     // (`{"2": {...}, "3": {...}, ...}`) directly into a `u32`-keyed map --
     // serde_json supports non-string map keys that implement `FromStr`
@@ -124,22 +152,39 @@ mod tests {
 
     #[test]
     fn pacing_margins_are_the_current_research_validated_value() {
-        // 10.0/10.0, not the earlier unvalidated 15.0/15.0 placeholder --
-        // study/research/wcps-v3-research-gaps-findings.md's margin sweep
-        // result. A future re-calibration is expected to change this
-        // number and this test right along with it (update BOTH the
+        // `stutter_count_pct`: 0.7 absolute percentage points, not the
+        // earlier 10.0 percent-of-baseline-mean value --
+        // study/research/aveyo-tost-hotelling-fix-research.md Sec 1.4's
+        // margin sweep result (derived from 10% of dust2's own ~7.06%
+        // calibration-reference baseline mean, then confirmed against real
+        // dust2-scale data). `mean_abs_animation_error_ms` stays at 10.0
+        // percent of baseline -- a genuine millisecond-scale duration, not
+        // part of that fix. A future re-calibration is expected to change
+        // either number and this test right along with it (update BOTH the
         // embedded JSON and this assertion together, never one without the
-        // other) -- this test's job is to catch an accidental stale copy,
-        // not to freeze the number forever.
+        // other) -- this test's job is to catch an accidental stale copy or
+        // a unit slipping (a percent-of-baseline number under the
+        // absolute-points tag, or vice versa), not to freeze the numbers
+        // forever.
         let thr = load_calibrated_thresholds().unwrap();
         assert_eq!(
-            thr.pacing_tost_margins_pct.get("stutter_count_pct"),
-            Some(&10.0)
+            thr.pacing_tost_margins.get("stutter_count_pct"),
+            Some(&Margin::AbsolutePoints(0.7))
         );
         assert_eq!(
-            thr.pacing_tost_margins_pct
-                .get("mean_abs_animation_error_ms"),
-            Some(&10.0)
+            thr.pacing_tost_margins.get("mean_abs_animation_error_ms"),
+            Some(&Margin::RelativePct(10.0))
+        );
+    }
+
+    /// The bare-number shape the JSON used to carry: a unit-less margin is
+    /// exactly the ambiguity the tag exists to remove.
+    #[test]
+    fn a_margin_without_a_unit_tag_is_rejected() {
+        assert!(serde_json::from_str::<Margin>("0.7").is_err());
+        assert_eq!(
+            serde_json::from_str::<Margin>(r#"{"unit":"absolute_points","value":0.7}"#).unwrap(),
+            Margin::AbsolutePoints(0.7)
         );
     }
 }

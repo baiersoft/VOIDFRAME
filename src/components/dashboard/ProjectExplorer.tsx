@@ -1,6 +1,6 @@
 import React, { useState } from "react";
-import { Plus, Play, Sliders, Search, BarChart3, Trash2, X, Check, Shield } from "lucide-react";
-import type { Project, RunSummary } from "../../lib/bindings";
+import { Plus, Play, Sliders, Search, BarChart3, Trash2, X, Check, Shield, RefreshCw } from "lucide-react";
+import type { Project, RunState, RunSummary } from "../../lib/bindings";
 import { fmt } from "../charts/formatNumber";
 
 interface ProjectExplorerProps {
@@ -16,6 +16,18 @@ interface ProjectExplorerProps {
    * across the project's runs). */
   resultSummaries?: Record<string, RunSummary[]>;
   onDeleteProject?: (projectId: string) => void;
+  /** The dashboard-specific half of App.tsx's own crash-recovery banner
+   * (see App.tsx's top-level banner for the roll-back/dismiss half, which
+   * covers every crash phase): a run genuinely stranded mid-reboot --
+   * `reboot_pending` (never rebooted/resumed at all) or `boot_resume` (it
+   * rebooted, started resuming, then got interrupted again before
+   * finishing) -- gets a "Resume run" affordance here instead, since
+   * rolling it back would discard a run that's just waiting to continue.
+   * Does NOT cover the case where `--resume` already fired and is actively
+   * resuming this same run -- App.tsx's own mount-time routing sends that
+   * case straight to Monitor and never sets `crashedRun` at all. */
+  crashedRun?: RunState | null;
+  onResumeRun?: () => void;
 }
 
 /** Highest `winner_wcps` across a project's run history, or null when there
@@ -38,6 +50,8 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({
   isStarting,
   resultSummaries = {},
   onDeleteProject,
+  crashedRun = null,
+  onResumeRun,
 }) => {
   const [searchTerm, setSearchTerm] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -60,6 +74,25 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6 w-full relative">
+      {crashedRun &&
+        (crashedRun.phase.kind === "reboot_pending" || crashedRun.phase.kind === "boot_resume") &&
+        onResumeRun && (
+        <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 font-mono text-xs flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <RefreshCw className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>
+              A run for project {crashedRun.project_id} is waiting to resume after a reboot.
+            </span>
+          </div>
+          <button
+            onClick={onResumeRun}
+            className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-xs font-mono cursor-pointer shrink-0"
+          >
+            Resume Run
+          </button>
+        </div>
+      )}
+
       {/* Overview Stat Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <div className="glass-panel p-5 rounded-2xl space-y-1">
@@ -183,6 +216,11 @@ export const ProjectExplorer: React.FC<ProjectExplorerProps> = ({
                       <p className="text-xs text-white/60 font-body mt-1 line-clamp-2 leading-relaxed">
                         {project.description}
                       </p>
+                      {project.settings?.benchmark_kind === "aveyo_cfg_v2" && (
+                        <div className="mt-1.5 inline-block px-2 py-0.5 rounded-md bg-[#8b5cf6]/10 border border-[#8b5cf6]/30 text-[10px] font-mono text-[#8b5cf6]">
+                          AveYo benchmark.cfg v2
+                        </div>
+                      )}
                     </div>
 
                     {onDeleteProject && (

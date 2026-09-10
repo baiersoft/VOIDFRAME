@@ -1,8 +1,7 @@
 //! App-wide settings persisted at `<data_root>\config.json` (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §5.1) —
-//! PresentMon path, default warmup/measure loop counts, default capture
-//! duration, and whether Dry Run is on by default. Distinct from
-//! `Settings` (`settings.rs`), which is *per-project* run parameters —
-//! this is the one thing shared across every project.
+//! PresentMon path, HWiNFO path, and whether Dry Run is on by default.
+//! Distinct from `Settings` (`settings.rs`), which is *per-project* run
+//! parameters — this is the one thing shared across every project.
 
 use crate::error::Result;
 use crate::paths::atomic_write;
@@ -55,14 +54,10 @@ fn default_thermal_cooldown_enabled() -> bool {
     true
 }
 
-fn default_warmup() -> u32 {
-    2
-}
-fn default_measure() -> u32 {
-    3
-}
-fn default_capture() -> u32 {
-    105
+/// Spec D5: Windows runs maintenance in the first minutes after boot, so
+/// `--resume` waits this long before touching anything.
+fn default_post_boot_settle_seconds() -> u32 {
+    180
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -70,12 +65,6 @@ fn default_capture() -> u32 {
 pub struct Config {
     #[serde(default = "default_presentmon_path")]
     pub presentmon_path: String,
-    #[serde(default = "default_warmup")]
-    pub default_warmup_loops: u32,
-    #[serde(default = "default_measure")]
-    pub default_measure_loops: u32,
-    #[serde(default = "default_capture")]
-    pub default_capture_seconds: u32,
     #[serde(default)]
     pub dry_run_default: bool,
     #[serde(default)]
@@ -86,19 +75,36 @@ pub struct Config {
     /// On by default -- see `default_thermal_cooldown_enabled`.
     #[serde(default = "default_thermal_cooldown_enabled")]
     pub thermal_cooldown_enabled: bool,
+    /// Spec §7 / D3: default state of the countdown modal's "Shut down when
+    /// the run completes" toggle. Off by default -- an unattended shutdown
+    /// is an opt-in behavior change to what the machine does on its own.
+    #[serde(default)]
+    pub shutdown_when_complete_default: bool,
+    /// Spec D5: default `RunConfig::post_boot_settle` in seconds.
+    #[serde(default = "default_post_boot_settle_seconds")]
+    pub post_boot_settle_seconds: u32,
+    /// Whether the user has dismissed the one-time "custom scripts run
+    /// elevated, VOIDFRAME can't verify what they do" warning -- shown once,
+    /// the first time they ever add a `custom_script` module, not per-script
+    /// or per-run (the per-script hash-tracking confirmation gate this used
+    /// to be was ruled too unpractical for a single-user, locally-run app
+    /// where the user is always the one who wrote the script in the first
+    /// place).
+    #[serde(default)]
+    pub custom_script_warning_seen: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             presentmon_path: default_presentmon_path(),
-            default_warmup_loops: default_warmup(),
-            default_measure_loops: default_measure(),
-            default_capture_seconds: default_capture(),
             dry_run_default: false,
             last_known_cs2_build_id: None,
             hwinfo_path: default_hwinfo_path(),
             thermal_cooldown_enabled: default_thermal_cooldown_enabled(),
+            shutdown_when_complete_default: false,
+            post_boot_settle_seconds: default_post_boot_settle_seconds(),
+            custom_script_warning_seen: false,
         }
     }
 }
@@ -158,9 +164,6 @@ mod tests {
     fn default_has_a_real_usable_presentmon_path_guess() {
         let c = Config::default();
         assert!(!c.presentmon_path.is_empty());
-        assert_eq!(c.default_warmup_loops, 2);
-        assert_eq!(c.default_measure_loops, 3);
-        assert_eq!(c.default_capture_seconds, 105);
         assert!(!c.dry_run_default);
     }
 
@@ -244,7 +247,7 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{"presentmon_path":"C:\\PresentMon.exe"}"#).unwrap();
         let c = Config::load(&path).unwrap();
-        assert_eq!(c.default_measure_loops, 3); // fell back to default
+        assert!(c.thermal_cooldown_enabled); // fell back to default
     }
 
     #[test]
@@ -282,6 +285,20 @@ mod tests {
     }
 
     #[test]
+    fn default_shutdown_and_post_boot_settle_match_the_spec() {
+        let c = Config::default();
+        assert!(!c.shutdown_when_complete_default);
+        assert_eq!(c.post_boot_settle_seconds, 180);
+    }
+
+    #[test]
+    fn empty_json_deserializes_shutdown_and_post_boot_settle_to_their_defaults() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.shutdown_when_complete_default);
+        assert_eq!(c.post_boot_settle_seconds, 180);
+    }
+
+    #[test]
     fn load_leaves_a_resolvable_presentmon_path_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -295,5 +312,31 @@ mod tests {
         c.save(&path).unwrap();
         let reloaded = Config::load(&path).unwrap();
         assert_eq!(reloaded.presentmon_path, presentmon_path);
+    }
+
+    #[test]
+    fn custom_script_warning_seen_defaults_to_false_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let exe = dir.path().join("PresentMon.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+
+        let c = Config::default();
+        assert!(!c.custom_script_warning_seen);
+
+        let c2 = Config {
+            presentmon_path: exe.to_string_lossy().into_owned(),
+            custom_script_warning_seen: true,
+            ..Default::default()
+        };
+        c2.save(&path).unwrap();
+        let reloaded = Config::load(&path).unwrap();
+        assert!(reloaded.custom_script_warning_seen);
+    }
+
+    #[test]
+    fn empty_json_deserializes_custom_script_warning_seen_to_false() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.custom_script_warning_seen);
     }
 }

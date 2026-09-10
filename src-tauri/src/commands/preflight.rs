@@ -9,10 +9,17 @@ pub(crate) async fn preflight_impl(
     last_known_build_id: Option<&str>,
     min_free_bytes: u64,
     scenarios: &[Scenario],
+    benchmark_kind: voidframe_engine::model::BenchmarkKind,
 ) -> Result<PreflightReport, String> {
-    let facts = gather_facts(sys, last_known_build_id, min_free_bytes, scenarios)
-        .await
-        .map_err(|e| e.to_string())?;
+    let facts = gather_facts(
+        sys,
+        last_known_build_id,
+        min_free_bytes,
+        scenarios,
+        benchmark_kind,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(evaluate(&facts))
 }
 
@@ -28,19 +35,35 @@ pub async fn preflight(
     // Best-effort: pre-flight is reachable with no project selected (the
     // header bar opens it unconditionally), and a project that fails to
     // load must not block the rest of pre-flight's genuinely useful
-    // system-state checks -- it just means the power-plan-noop check has
-    // nothing to compare against.
-    let scenarios = match project_id {
-        Some(id) => Project::load(&state.data_root.projects_dir().join(format!("{id}.json")))
-            .map(|p| p.scenarios)
-            .unwrap_or_default(),
-        None => Vec::new(),
+    // system-state checks. The fallback is not free, though: with no
+    // scenarios the noop checks have nothing to compare against, and the
+    // default `WorkshopDust2` kind runs the Block-tier `workshop_map` probe
+    // that an AveYo project would have skipped -- so a load failure is
+    // logged rather than swallowed, and the report it produces is the
+    // "no project" report, not the selected project's.
+    let (scenarios, benchmark_kind) = match project_id {
+        Some(id) => match Project::load(&state.data_root.projects_dir().join(format!("{id}.json")))
+        {
+            Ok(p) => (p.scenarios, p.settings.benchmark_kind),
+            Err(e) => {
+                log::warn!(
+                    "preflight: project {id} failed to load ({e}); reporting without its \
+                     scenarios or benchmark kind"
+                );
+                Default::default()
+            }
+        },
+        None => (
+            Vec::new(),
+            voidframe_engine::model::BenchmarkKind::default(),
+        ),
     };
     preflight_impl(
         state.sys.as_ref(),
         last_known.as_deref(),
         MIN_FREE_DISK_BYTES,
         &scenarios,
+        benchmark_kind,
     )
     .await
 }
@@ -56,9 +79,15 @@ mod tests {
             running: true,
             elevated: false,
         });
-        let report = preflight_impl(&sys, None, 2_000_000_000, &[])
-            .await
-            .unwrap();
+        let report = preflight_impl(
+            &sys,
+            None,
+            2_000_000_000,
+            &[],
+            voidframe_engine::model::BenchmarkKind::WorkshopDust2,
+        )
+        .await
+        .unwrap();
         // Every blocking check `gather_facts` runs (CS2 install, workshop
         // map, disk space, Steam-running) now reads through
         // `SystemController` (`sys.app_manifest`,
@@ -93,9 +122,15 @@ mod tests {
                 create_if_missing: false,
             })],
         }];
-        let report = preflight_impl(&sys, None, 2_000_000_000, &scenarios)
-            .await
-            .unwrap();
+        let report = preflight_impl(
+            &sys,
+            None,
+            2_000_000_000,
+            &scenarios,
+            voidframe_engine::model::BenchmarkKind::WorkshopDust2,
+        )
+        .await
+        .unwrap();
         let check = report
             .checks
             .iter()

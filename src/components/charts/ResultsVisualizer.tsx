@@ -1,13 +1,37 @@
-import React, { useMemo, useState } from "react";
-import { Award, BarChart3, Check, Copy, Share2, TrendingUp, Activity, ChevronDown, ChevronUp } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { Award, BarChart3, Check, Copy, Share2, TrendingUp, Activity, ChevronDown, ChevronUp, AlertTriangle, PowerOff } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, Legend } from "recharts";
-import type { RunResults, ScenarioResult, Verdict } from "../../lib/bindings";
+import { cancelShutdown } from "../../lib/api";
+import type { RunProgress, RunResults, RunSummary, ScenarioResult, Verdict } from "../../lib/bindings";
 import { SocialShareModal } from "../modals/SocialShareModal";
 import { FrameTimeChart } from "./FrameTimeChart";
 import { fmt } from "./formatNumber";
 
 interface ResultsVisualizerProps {
-  results: RunResults;
+  /** `null` once a run was recovered mid-flight and never reached REPORT --
+   * `progress` (below) then carries whatever scenarios did finish. */
+  results: RunResults | null;
+  /** `getRunProgress(runId)`'s own result, App-fetched -- used only as the
+   * `results === null` fallback source of completed/unstable scenarios;
+   * ignored once `results` is present (a finished run's own file is
+   * authoritative). */
+  progress?: RunProgress | null;
+  /** A distinct, narrower signal than `App.tsx`'s own `RunOutcome` (which
+   * stays binary complete/failed for `LiveMonitor` -- see task-15's report
+   * for why this isn't folded into that same union). Set once `RunComplete`
+   * arrives and the run's `shutdown_when_complete` was true. */
+  runOutcome?: { kind: "shutdown_requested" } | null;
+  /** The current project's other runs (App.tsx's own `resultSummaries`
+   * cache, already fetched for the dashboard's "N runs" pill), newest
+   * first -- drives the run-switcher dropdown on the `RUN {runId}` label.
+   * Omitted (rather than empty) hides the dropdown entirely, e.g. for a
+   * mid-flight-recovered run this component reaches with no project
+   * context to look history up in. */
+  runHistory?: RunSummary[];
+  /** Switches the visualizer to a different run from `runHistory`. Required
+   * whenever `runHistory` is passed. */
+  onSelectRun?: (runId: string) => void;
 }
 
 const VERDICT_STYLES: Record<Verdict, { label: string; className: string }> = {
@@ -38,37 +62,139 @@ function renderDeltaInline(delta: number | null, invertColor = false) {
   );
 }
 
-export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results }) => {
+export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({
+  results,
+  progress = null,
+  runOutcome = null,
+  runHistory,
+  onSelectRun,
+}) => {
   const [copiedMd, setCopiedMd] = useState(false);
   const [isSocialShareOpen, setIsSocialShareOpen] = useState(false);
   const [activeChartTab, setActiveChartTab] = useState<ChartTab>("percentiles");
   const [expandedScenarioId, setExpandedScenarioId] = useState<string | null>(null);
+  const [isCancellingShutdown, setIsCancellingShutdown] = useState(false);
+  const [cancelShutdownError, setCancelShutdownError] = useState<string | null>(null);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  // Viewport coordinates for the portalled dropdown below, computed from
+  // the trigger button's own rect when it opens -- the header it lives in
+  // is a `.glass-panel` (`contain: paint` in index.css), which clips any
+  // plain `position: absolute` descendant to the panel's own box instead of
+  // letting it float above the rest of the page. Portalling to `document.
+  // body` (render call below) escapes that clip entirely; `position: fixed`
+  // + these coordinates is what re-anchors it under the button once it's
+  // no longer a DOM descendant of it.
+  const [historyMenuPos, setHistoryMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const historyTriggerRef = useRef<HTMLButtonElement>(null);
+  const historyMenuRef = useRef<HTMLDivElement>(null);
+
+  // Closes the run-switcher dropdown on an outside click, Escape, or a
+  // scroll anywhere (capture: true so this also sees scroll events from a
+  // scrollable ancestor, e.g. the results page's own scroll container,
+  // which don't bubble to `document`) -- a scroll would otherwise leave the
+  // fixed-position portal visually detached from the button that opened it.
+  // Listeners attached only while the dropdown is actually open.
+  useEffect(() => {
+    if (!isHistoryOpen) return;
+    const handlePointerDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (
+        !historyTriggerRef.current?.contains(target) &&
+        !historyMenuRef.current?.contains(target)
+      ) {
+        setIsHistoryOpen(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsHistoryOpen(false);
+    };
+    const handleScroll = () => setIsHistoryOpen(false);
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("scroll", handleScroll, true);
+    window.addEventListener("resize", handleScroll);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("scroll", handleScroll, true);
+      window.removeEventListener("resize", handleScroll);
+    };
+  }, [isHistoryOpen]);
+
+  const toggleHistoryMenu = () => {
+    if (!isHistoryOpen && historyTriggerRef.current) {
+      const rect = historyTriggerRef.current.getBoundingClientRect();
+      setHistoryMenuPos({ top: rect.bottom + 8, left: rect.left });
+    }
+    setIsHistoryOpen((prev) => !prev);
+  };
+
+  // A finished run's own `results.json` is authoritative once it exists;
+  // `progress.completed` (baseline first, then scenarios in run order --
+  // mirrors `finish_run`'s own `completed.first()` / `completed[1..]` split
+  // in crates/voidframe-engine/src/run/execute/mod.rs) is only the fallback
+  // for a run recovered mid-flight, before REPORT ever wrote that file.
+  const baseline: ScenarioResult | null = results?.baseline ?? progress?.completed[0] ?? null;
+  const scenarios: ScenarioResult[] = results?.scenarios ?? progress?.completed.slice(1) ?? [];
+  // Same rule as above: `results.json` carries its own `unstable` list
+  // (copied from progress at REPORT), so a finished run -- including an
+  // older one picked from the run history -- never reads the *current*
+  // run's progress for it.
+  const unstable = results?.unstable ?? progress?.unstable ?? [];
+  const runId = results?.run_id ?? progress?.run_id ?? "—";
 
   const sortedScenarios = useMemo(
-    () =>
-      [...results.scenarios].sort(
-        (a, b) => (b.wcps ?? -Infinity) - (a.wcps ?? -Infinity)
-      ),
-    [results.scenarios]
+    () => [...scenarios].sort((a, b) => (b.wcps ?? -Infinity) - (a.wcps ?? -Infinity)),
+    [scenarios]
   );
-  const winner: ScenarioResult | undefined = sortedScenarios[0];
+  // The top-ranked scenario by wcps is only a genuine "winner" if the
+  // statistics themselves say it beat baseline -- a Worse (or the only,
+  // trivially-top-ranked-by-default) scenario must never be crowned just
+  // because sorting always produces *some* first element. Confirmed as a
+  // real bug on alpha-tester data: study/pamuk/ab-test-analysis-report.md §7.
+  //
+  // Must match RunResults::summarize()'s rule on the Rust side EXACTLY:
+  // filter to Better scenarios, THEN rank by wcps -- not "rank by wcps,
+  // then check if the top one is Better", which disagrees with the Rust
+  // side whenever a non-Better scenario (e.g. Inconclusive) outranks the
+  // best genuinely-Better one by raw wcps. `sortedScenarios` is already
+  // sorted descending by wcps, so `.find` on it is exactly "filter then
+  // take the highest-ranked survivor." Confirmed as a real cross-
+  // implementation inconsistency in this plan's own whole-branch review.
+  const winner: ScenarioResult | undefined = sortedScenarios.find(
+    (s) => s.verdict === "better"
+  );
+
+  const handleCancelShutdown = async () => {
+    setCancelShutdownError(null);
+    setIsCancellingShutdown(true);
+    try {
+      await cancelShutdown();
+    } catch (e) {
+      setCancelShutdownError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsCancellingShutdown(false);
+    }
+  };
 
   const round1 = (n: number) => Math.round(n * 10) / 10;
 
-  const barChartData = [
-    {
-      name: "Baseline",
-      Avg: round1(results.baseline.aggregated.avg_fps ?? 0),
-      P1: round1(results.baseline.aggregated.p1_fps ?? 0),
-      P01: round1(results.baseline.aggregated.p01_fps ?? 0),
-    },
-    ...sortedScenarios.map((s) => ({
-      name: s.name.length > 20 ? s.name.substring(0, 18) + "..." : s.name,
-      Avg: round1(s.aggregated.avg_fps ?? 0),
-      P1: round1(s.aggregated.p1_fps ?? 0),
-      P01: round1(s.aggregated.p01_fps ?? 0),
-    })),
-  ];
+  const barChartData = baseline
+    ? [
+        {
+          name: "Baseline",
+          Avg: round1(baseline.aggregated.avg_fps ?? 0),
+          P1: round1(baseline.aggregated.p1_fps ?? 0),
+          P01: round1(baseline.aggregated.p01_fps ?? 0),
+        },
+        ...sortedScenarios.map((s) => ({
+          name: s.name.length > 20 ? s.name.substring(0, 18) + "..." : s.name,
+          Avg: round1(s.aggregated.avg_fps ?? 0),
+          P1: round1(s.aggregated.p1_fps ?? 0),
+          P01: round1(s.aggregated.p01_fps ?? 0),
+        })),
+      ]
+    : [];
 
   const wcpsChartData = sortedScenarios.map((s) => ({
     name: s.name.length > 20 ? s.name.substring(0, 18) + "..." : s.name,
@@ -82,6 +208,11 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
   }));
 
   const handleCopyMarkdown = () => {
+    // Only ever called from the button below, which is itself gated on
+    // `results !== null` (a Markdown export of an in-progress/incomplete
+    // run isn't a meaningful artifact) -- this guard just satisfies the
+    // type-checker's narrowing.
+    if (!results) return;
     const rows = [
       `| **${results.baseline.name}** | ${fmt(results.baseline.aggregated.avg_fps)} | ${fmt(results.baseline.aggregated.p1_fps)} | ${fmt(results.baseline.aggregated.p01_fps)} | ${fmt(results.baseline.aggregated.adaptive_frame_time_cv !== null ? results.baseline.aggregated.adaptive_frame_time_cv * 100 : null)}% | ${fmt(results.baseline.aggregated.stutter_count_pct)}% | ${fmt(results.baseline.aggregated.mean_abs_animation_error_ms)} | — | Baseline |`,
       ...sortedScenarios.map((s) => {
@@ -95,14 +226,71 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
     setTimeout(() => setCopiedMd(false), 2000);
   };
 
-  const baselineCv = results.baseline.aggregated.frame_time_cv;
+  const baselineCv = baseline?.aggregated.frame_time_cv ?? null;
 
   const toggleExpand = (scenarioId: string) => {
     setExpandedScenarioId((prev) => (prev === scenarioId ? null : scenarioId));
   };
 
+  if (!baseline) {
+    return (
+      <div className="p-12 text-center text-white/50 font-mono text-sm">
+        No results loaded yet.
+      </div>
+    );
+  }
+
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6 w-full">
+      {isHistoryOpen &&
+        historyMenuPos &&
+        runHistory &&
+        createPortal(
+          <div
+            ref={historyMenuRef}
+            style={{ top: historyMenuPos.top, left: historyMenuPos.left }}
+            // A solid(-ish), highly opaque background rather than the
+            // shared `.glass-panel` class -- that class leans on
+            // `backdrop-filter: blur` with only ~1.5% white behind it,
+            // which reads fine sitting over this page's own background but
+            // isn't legible for a floating menu that can end up over
+            // arbitrary page content once portalled (confirmed unreadable
+            // live). Border/shadow/blur kept to stay visually in the same
+            // "glass" family as the rest of the UI.
+            className="fixed w-72 max-h-72 overflow-y-auto bg-[#08080c]/95 backdrop-blur-xl border border-white/10 rounded-xl p-1.5 z-[100] shadow-xl font-mono text-xs normal-case"
+          >
+            {runHistory.length === 0 ? (
+              <div className="px-3 py-2 text-white/40">No runs yet.</div>
+            ) : (
+              runHistory.map((run) => {
+                const isActive = run.run_id === runId;
+                return (
+                  <button
+                    key={run.run_id}
+                    onClick={() => {
+                      setIsHistoryOpen(false);
+                      if (!isActive) onSelectRun?.(run.run_id);
+                    }}
+                    className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between gap-2 cursor-pointer ${
+                      isActive ? "bg-white/10 text-white" : "text-white/70 hover:bg-white/5 hover:text-white"
+                    }`}
+                  >
+                    <span className="flex flex-col">
+                      <span>{new Date(run.completed_at).toLocaleString()}</span>
+                      <span className="text-white/40">
+                        {run.winner_name
+                          ? `Winner: ${run.winner_name}${run.winner_wcps !== null ? ` (${fmt(run.winner_wcps)} WCPS)` : ""}`
+                          : `${run.scenario_count} scenario${run.scenario_count === 1 ? "" : "s"}`}
+                      </span>
+                    </span>
+                    {isActive && <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
+                  </button>
+                );
+              })
+            )}
+          </div>,
+          document.body
+        )}
       {/* Header & Winner Banner */}
       <div className="glass-panel p-6 rounded-2xl space-y-5">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
@@ -110,30 +298,64 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
             <div className="flex items-center gap-2 text-xs font-mono text-white/50 uppercase">
               <Award className="w-4 h-4 text-amber-400" />
               <span>BENCHMARK RESULTS //</span>
-              <span className="text-[#8b5cf6]">RUN {results.run_id}</span>
+              {runHistory ? (
+                <button
+                  ref={historyTriggerRef}
+                  onClick={toggleHistoryMenu}
+                  className="flex items-center gap-1 text-[#8b5cf6] hover:text-[#a78bfa] cursor-pointer normal-case"
+                >
+                  <span className="uppercase">RUN {runId}</span>
+                  {isHistoryOpen ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                </button>
+              ) : (
+                <span className="text-[#8b5cf6]">RUN {runId}</span>
+              )}
             </div>
-            <p className="text-xs text-white/50 font-mono">
-              Completed {new Date(results.completed_at).toLocaleString()} • Detection: {results.detection_tier}
-            </p>
+            {results ? (
+              <p className="text-xs text-white/50 font-mono">
+                Completed {new Date(results.completed_at).toLocaleString()} • Detection: {results.detection_tier}
+              </p>
+            ) : (
+              <p className="text-xs text-amber-300 font-mono">Incomplete run — recovered mid-flight</p>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            <button
-              onClick={() => setIsSocialShareOpen(true)}
-              className="px-3.5 py-2 rounded-xl bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-[0_0_15px_rgba(139,92,246,0.15)]"
-            >
-              <Share2 className="w-3.5 h-3.5" />
-              <span>Social Share Card</span>
-            </button>
-            <button
-              onClick={handleCopyMarkdown}
-              className="glass-pill px-3.5 py-2 rounded-xl text-xs font-mono text-white/80 hover:text-white flex items-center gap-1.5 cursor-pointer"
-            >
-              {copiedMd ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copiedMd ? "Copied Markdown" : "Markdown Table"}</span>
-            </button>
+            {runOutcome?.kind === "shutdown_requested" && (
+              <button
+                onClick={handleCancelShutdown}
+                disabled={isCancellingShutdown}
+                className="px-3.5 py-2 rounded-xl bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <PowerOff className="w-3.5 h-3.5" />
+                <span>Cancel shutdown</span>
+              </button>
+            )}
+            {results && (
+              <>
+                <button
+                  onClick={() => setIsSocialShareOpen(true)}
+                  className="px-3.5 py-2 rounded-xl bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 text-xs font-mono font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-[0_0_15px_rgba(139,92,246,0.15)]"
+                >
+                  <Share2 className="w-3.5 h-3.5" />
+                  <span>Social Share Card</span>
+                </button>
+                <button
+                  onClick={handleCopyMarkdown}
+                  className="glass-pill px-3.5 py-2 rounded-xl text-xs font-mono text-white/80 hover:text-white flex items-center gap-1.5 cursor-pointer"
+                >
+                  {copiedMd ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedMd ? "Copied Markdown" : "Markdown Table"}</span>
+                </button>
+              </>
+            )}
           </div>
         </div>
+        {cancelShutdownError && (
+          <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs font-mono">
+            {cancelShutdownError}
+          </div>
+        )}
 
         {/* Winner Highlight Card */}
         {winner && (
@@ -180,7 +402,7 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
         </div>
 
         {/* Present-mode warnings */}
-        {[results.baseline, ...results.scenarios]
+        {[baseline, ...scenarios]
           .filter((s) => s.aggregated.present_mode_warning)
           .map((s) => (
             <div
@@ -190,6 +412,21 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
               <strong>{s.name}:</strong> {s.aggregated.present_mode_warning}
             </div>
           ))}
+
+        {/* Unstable scenarios (a run recovered mid-flight after a bugcheck/
+            crash on one or more scenarios -- spec §4/§11) */}
+        {unstable.length > 0 && (
+          <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-[11px] font-mono text-amber-300 space-y-1">
+            <div className="flex items-center gap-1.5 font-bold uppercase">
+              <AlertTriangle className="w-3.5 h-3.5" /> Unstable Scenarios
+            </div>
+            {unstable.map((u) => (
+              <div key={u.scenario_id}>
+                <strong>{u.scenario_id}:</strong> {u.reason}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Segmented Chart View */}
@@ -272,7 +509,7 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
             <div className="text-[11px] text-white/50 font-mono">
               High-resolution uPlot canvas overlay of frame times across recorded iterations.
             </div>
-            <FrameTimeChart baseline={results.baseline} scenarios={sortedScenarios} />
+            <FrameTimeChart baseline={baseline} scenarios={sortedScenarios} />
           </div>
         )}
 
@@ -352,7 +589,7 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
                 <td className="py-3 pl-3 font-bold text-purple-300">
                   <div className="flex items-center gap-2">
                     <span className="w-1.5 h-1.5 rounded-full bg-[#8b5cf6]" />
-                    <span>{results.baseline.name}</span>
+                    <span>{baseline.name}</span>
                     <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-normal">
                       BASELINE
                     </span>
@@ -365,26 +602,26 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
                 </td>
                 <td className="py-3 text-right font-bold text-white/40">—</td>
                 <td className="py-3 text-right font-bold text-white/90">
-                  {fmt(results.baseline.aggregated.avg_fps)}
+                  {fmt(baseline.aggregated.avg_fps)}
                 </td>
                 <td className="py-3 text-right font-bold text-white/90">
-                  {fmt(results.baseline.aggregated.p1_fps)}
+                  {fmt(baseline.aggregated.p1_fps)}
                 </td>
                 <td className="py-3 text-right text-white/70">
-                  {fmt(results.baseline.aggregated.p01_fps)}
+                  {fmt(baseline.aggregated.p01_fps)}
                 </td>
                 <td className="py-3 text-right text-white/70">
-                  {results.baseline.aggregated.adaptive_frame_time_cv !== null
-                    ? `${(results.baseline.aggregated.adaptive_frame_time_cv * 100).toFixed(1)}%`
+                  {baseline.aggregated.adaptive_frame_time_cv !== null
+                    ? `${(baseline.aggregated.adaptive_frame_time_cv * 100).toFixed(1)}%`
                     : "—"}
                 </td>
                 <td className="py-3 text-right text-white/70">
-                  {results.baseline.aggregated.stutter_count_pct !== null
-                    ? `${results.baseline.aggregated.stutter_count_pct.toFixed(1)}%`
+                  {baseline.aggregated.stutter_count_pct !== null
+                    ? `${baseline.aggregated.stutter_count_pct.toFixed(1)}%`
                     : "—"}
                 </td>
                 <td className="py-3 text-right text-white/70">
-                  {fmt(results.baseline.aggregated.mean_abs_animation_error_ms)}
+                  {fmt(baseline.aggregated.mean_abs_animation_error_ms)}
                 </td>
                 <td className="py-3 pr-3 text-center text-white/30 text-[10px]">—</td>
               </tr>
@@ -423,6 +660,14 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
                         >
                           {VERDICT_STYLES[s.verdict].label}
                         </span>
+                        {s.script_reverted_unverified && (
+                          <span
+                            title="A custom script ran this scenario's revert -- VOIDFRAME cannot verify what it actually did to your system."
+                            className="ml-1.5 px-1.5 py-0.5 rounded text-[8px] font-bold border border-amber-500/40 text-amber-300 bg-amber-500/10"
+                          >
+                            SCRIPT-REVERTED
+                          </span>
+                        )}
                       </td>
 
                       <td className="py-3 text-right font-bold text-[#c084fc]">
@@ -580,12 +825,14 @@ export const ResultsVisualizer: React.FC<ResultsVisualizerProps> = ({ results })
         </div>
       </div>
 
-      <SocialShareModal
-        isOpen={isSocialShareOpen}
-        onClose={() => setIsSocialShareOpen(false)}
-        results={results}
-        winner={winner}
-      />
+      {results && (
+        <SocialShareModal
+          isOpen={isSocialShareOpen}
+          onClose={() => setIsSocialShareOpen(false)}
+          results={results}
+          winner={winner}
+        />
+      )}
     </div>
   );
 };

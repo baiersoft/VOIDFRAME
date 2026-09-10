@@ -70,7 +70,9 @@ mod tests {
         );
 
         let recs = Journal::load_pending(j.path()).unwrap();
-        revert_record(&recs[0], &mock, &ctx()).await.unwrap();
+        revert_record(&recs[0], dir.path(), &mock, &ctx())
+            .await
+            .unwrap();
         assert_eq!(
             mock.read_powercfg("sub_processor", "IDLEDISABLE")
                 .await

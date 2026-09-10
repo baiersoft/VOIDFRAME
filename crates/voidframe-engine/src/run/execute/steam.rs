@@ -51,15 +51,20 @@ pub(super) async fn ensure_steam_running(sys: &dyn SystemController) -> Result<(
         return Ok(());
     }
     let steam_exe = sys.steam_install_path().await?.join("steam.exe");
-    sys.launch_deelevated(&steam_exe.to_string_lossy(), "")
+    // `-silent`: Steam's own flag to start minimized to the tray without
+    // ever popping its main window up in the first place -- confirmed live
+    // to be more reliable than the close_steam_window() fallback below on
+    // its own, which depends on the window existing at the moment it's
+    // polled for and on Steam's "close button minimizes" setting being on.
+    sys.launch_deelevated(&steam_exe.to_string_lossy(), "-silent")
         .await?;
     wait_for_steam_and_webhelper(sys).await?;
 
-    // Steam just popped its window in focus because this call launched it
-    // (not because the user had it open already -- that case already
-    // returned above) -- close it (WM_CLOSE, not a real quit; relies on
-    // Steam's own "Close button minimizes Steam instead of exiting"
-    // setting) so it doesn't sit in the way of a benchmark run.
+    // Fallback for whatever `-silent` doesn't cover (e.g. a first-run EULA
+    // or update prompt) -- close any window Steam did pop up (WM_CLOSE, not
+    // a real quit; relies on Steam's own "Close button minimizes Steam
+    // instead of exiting" setting) so it doesn't sit in the way of a
+    // benchmark run. A no-op when `-silent` already left nothing to close.
     sys.close_steam_window().await?;
     // Safety net: closing a window only hides it to the tray if that Steam
     // setting is actually enabled -- if it isn't, WM_CLOSE fully exits the

@@ -226,19 +226,19 @@ fn evaluate_verdict_on_identical_fixture_rows_is_always_confirmed_same_across_se
     use rand::rngs::StdRng;
     use voidframe_engine::model::results::Verdict;
     use voidframe_engine::stats::v3::load_calibrated_thresholds;
-    use voidframe_engine::stats::v3::{WcpsV3Weights, evaluate_verdict};
+    use voidframe_engine::stats::v3::{Margin, WcpsV3Weights, evaluate_verdict};
 
     let thresholds = load_calibrated_thresholds().unwrap();
     let throughput = vec![[880.2, 338.1, 298.2, 0.41]; 3];
     let pacing = vec![[7.0, 0.22]; 3];
-    let throughput_margins: std::collections::BTreeMap<String, f64> = [
+    let throughput_margins: std::collections::BTreeMap<String, Margin> = [
         ("avg_fps", 3.0),
         ("p1_fps", 3.0),
         ("p01_fps", 3.0),
         ("adaptive_frame_time_cv", 10.0),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
+    .map(|(k, v)| (k.to_string(), Margin::RelativePct(v)))
     .collect();
 
     for seed in [1, 2, 3, 4, 5] {

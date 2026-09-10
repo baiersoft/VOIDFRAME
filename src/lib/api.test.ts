@@ -23,13 +23,17 @@ const { mockCommands, mockInvoke, mockListen } = vi.hoisted(() => ({
     saveConfig: vi.fn(),
     listCatalogTweaks: vi.fn(),
     startRun: vi.fn(),
+    resumeRun: vi.fn(),
     sendControl: vi.fn(),
     getResults: vi.fn(),
     getRunSnapshot: vi.fn(),
+    getRunProgress: vi.fn(),
     rollbackNow: vi.fn(),
     emergencyRollback: vi.fn(),
     openDataDir: vi.fn(),
     revealRestoreBat: vi.fn(),
+    readRegistryValue: vi.fn(),
+    cancelShutdown: vi.fn(),
   },
   mockInvoke: vi.fn(),
   mockListen: vi.fn(),
@@ -51,12 +55,15 @@ vi.mock("@tauri-apps/api/event", () => ({
 // this import ordering is safe -- the mocks are in place before api.ts's own
 // top-level code, if any, runs).
 import {
+  cancelShutdown,
   closeWindow,
   getProject,
+  getRunProgress,
   getRunSnapshot,
   isWindowMaximized,
   listProjects,
   minimizeWindow,
+  readRegistryValue,
   saveProject,
   startRun,
   subscribeToEngineEvents,
@@ -96,11 +103,11 @@ describe("api command wrappers (generated bindings)", () => {
     await expect(getProject("missing")).rejects.toThrow("project not found");
   });
 
-  it("startRun passes both arguments through positionally", async () => {
+  it("startRun passes all three arguments through positionally", async () => {
     mockCommands.startRun.mockResolvedValue({ status: "ok", data: "run-123" });
-    const result = await startRun("p1", true);
+    const result = await startRun("p1", true, false);
     expect(result).toBe("run-123");
-    expect(mockCommands.startRun).toHaveBeenCalledWith("p1", true);
+    expect(mockCommands.startRun).toHaveBeenCalledWith("p1", true, false);
   });
 
   it("saveProject resolves to void on Ok", async () => {
@@ -122,6 +129,53 @@ describe("api command wrappers (generated bindings)", () => {
     mockCommands.getRunSnapshot.mockResolvedValue({ status: "ok", data: null });
     const result = await getRunSnapshot();
     expect(result).toBeNull();
+  });
+
+  it("readRegistryValue passes all three arguments through and resolves to Ok data", async () => {
+    mockCommands.readRegistryValue.mockResolvedValue({
+      status: "ok",
+      data: { present: true, value: { type: "DWORD", value: 2 } },
+    });
+    const result = await readRegistryValue("HKLM", "SYSTEM\\Foo", "HwSchMode");
+    expect(result).toEqual({ present: true, value: { type: "DWORD", value: 2 } });
+    expect(mockCommands.readRegistryValue).toHaveBeenCalledWith("HKLM", "SYSTEM\\Foo", "HwSchMode");
+  });
+
+  it("readRegistryValue rejects with the backend's error message on Err", async () => {
+    mockCommands.readRegistryValue.mockResolvedValue({
+      status: "error",
+      error: "invalid subkey",
+    });
+    await expect(readRegistryValue("HKLM", "..", "V")).rejects.toThrow("invalid subkey");
+  });
+
+  it("cancelShutdown resolves to void on Ok", async () => {
+    mockCommands.cancelShutdown.mockResolvedValue({ status: "ok", data: null });
+    await expect(cancelShutdown()).resolves.toBeUndefined();
+    expect(mockCommands.cancelShutdown).toHaveBeenCalledWith();
+  });
+
+  it("cancelShutdown rejects with the backend's error message on Err", async () => {
+    mockCommands.cancelShutdown.mockResolvedValue({
+      status: "error",
+      error: "no shutdown pending",
+    });
+    await expect(cancelShutdown()).rejects.toThrow("no shutdown pending");
+  });
+
+  it("getRunProgress resolves to null when there is no progress file", async () => {
+    mockCommands.getRunProgress.mockResolvedValue({ status: "ok", data: null });
+    const result = await getRunProgress("r1");
+    expect(result).toBeNull();
+    expect(mockCommands.getRunProgress).toHaveBeenCalledWith("r1");
+  });
+
+  it("getRunProgress rejects with the backend's error message on Err", async () => {
+    mockCommands.getRunProgress.mockResolvedValue({
+      status: "error",
+      error: "invalid run id",
+    });
+    await expect(getRunProgress("../evil")).rejects.toThrow("invalid run id");
   });
 });
 

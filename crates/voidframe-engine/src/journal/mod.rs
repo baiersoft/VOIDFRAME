@@ -3,7 +3,9 @@
 //! line, then a follow-up `applied: true` line) makes a crash mid-mutation
 //! recoverable — [`replay`] treats an unconfirmed record defensively.
 
+pub mod live;
 pub mod replay;
+pub mod restore_script;
 
 use crate::error::Result;
 use crate::system::MutationCtx;
@@ -21,6 +23,8 @@ pub enum Op {
     PowerPlanActivate,
     PowerPlanCreate,
     PowerPlanDelete,
+    CustomScriptApply,
+    Cs2ConfigApply,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

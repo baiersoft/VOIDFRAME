@@ -9,9 +9,15 @@
     "stutter_count_pct",
     "mean_abs_animation_error_ms"
   ],
-  "pacing_tost_margins_pct": {
-    "stutter_count_pct": 10.0,
-    "mean_abs_animation_error_ms": 10.0
+  "pacing_tost_margins": {
+    "stutter_count_pct": {
+      "unit": "absolute_points",
+      "value": 0.7
+    },
+    "mean_abs_animation_error_ms": {
+      "unit": "relative_pct",
+      "value": 10.0
+    }
   },
   "thresholds": {
     "2": {

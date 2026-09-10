@@ -17,8 +17,19 @@ export const commands = {
 	getConfig: () => typedError<Config, string>(__TAURI_INVOKE("get_config")),
 	saveConfig: (config: Config) => typedError<null, string>(__TAURI_INVOKE("save_config", { config })),
 	listCatalogTweaks: () => typedError<CatalogEntry[], string>(__TAURI_INVOKE("list_catalog_tweaks")),
-	startRun: (projectId: string, dryRun: boolean) => typedError<string, string>(__TAURI_INVOKE("start_run", { projectId, dryRun })),
+	readCs2VideoConfig: () => typedError<{ [key in string]: string }, string>(__TAURI_INVOKE("read_cs2_video_config")),
+	importCustomScript: (projectId: string, sourcePath: string) => typedError<string, string>(__TAURI_INVOKE("import_custom_script", { projectId, sourcePath })),
+	startRun: (projectId: string, dryRun: boolean, shutdownWhenComplete: boolean) => typedError<string, string>(__TAURI_INVOKE("start_run", { projectId, dryRun, shutdownWhenComplete })),
+	resumeRun: () => typedError<string, string>(__TAURI_INVOKE("resume_run")),
+	/**
+	 *  Whether this process was launched via `--resume` -- see
+	 *  [`crate::state::AppState::resume_launch`]'s own doc comment for why the
+	 *  frontend needs this exposed synchronously, separately from
+	 *  `resume_run_impl`'s own completion.
+	 */
+	isResumeLaunch: () => typedError<boolean, string>(__TAURI_INVOKE("is_resume_launch")),
 	sendControl: (msg: ControlMsg) => typedError<null, string>(__TAURI_INVOKE("send_control", { msg })),
+	setShutdownWhenComplete: (value: boolean) => typedError<null, string>(__TAURI_INVOKE("set_shutdown_when_complete", { value })),
 	getResults: (runId: string) => typedError<RunResults, string>(__TAURI_INVOKE("get_results", { runId })),
 	listResults: (projectId: string) => typedError<RunSummary[], string>(__TAURI_INVOKE("list_results", { projectId })),
 	getRunSnapshot: () => typedError<{
@@ -30,10 +41,43 @@ export const commands = {
 	completed_scenarios: string[],
 	revision: number,
 } | null, string>(__TAURI_INVOKE("get_run_snapshot")),
+	getRunProgress: (runId: string) => typedError<{
+	schema_version: string,
+	run_id: string,
+	project: Project,
+	start_build_id: string | null,
+	start_launch_args: string,
+	start_launch_args_raw: string,
+	start_power_plan: PowerPlan,
+	thermal_baseline: ThermalReading | null,
+	completed: ScenarioResult[],
+	unstable: UnstableScenario[],
+	cursor: Cursor,
+	reboot: PendingReboot | null,
+	shutdown_when_complete: boolean,
+	/**
+	 *  Set by the resume path after a bad boot reverted the scenario at
+	 *  the cursor; the loop's Revert arm skips `revert_stage` once and
+	 *  clears it.
+	 */
+	skip_revert_once?: boolean,
+	/**
+	 *  Set immediately before `scenario_loop` would otherwise call
+	 *  `reboot_sequence` while an operator Abort is pending (`*ctx.abort.
+	 *  borrow()` true), so the reboot is skipped and this run's `Err` exit
+	 *  is durable across a process restart -- see `begin_resume`'s own
+	 *  check of this field. `#[serde(default)]` for the same reason as
+	 *  `skip_revert_once`: every `progress.json` written before this field
+	 *  existed must still parse.
+	 */
+	abort_requested?: boolean,
+} | null, string>(__TAURI_INVOKE("get_run_progress", { runId })),
 	rollbackNow: () => typedError<RevertReport, string>(__TAURI_INVOKE("rollback_now")),
 	emergencyRollback: () => typedError<RevertReport[], string>(__TAURI_INVOKE("emergency_rollback")),
 	openDataDir: () => typedError<null, string>(__TAURI_INVOKE("open_data_dir")),
 	revealRestoreBat: () => typedError<null, string>(__TAURI_INVOKE("reveal_restore_bat")),
+	readRegistryValue: (hive: Hive, subkey: string, valueName: string) => typedError<RegistryValueView, string>(__TAURI_INVOKE("read_registry_value", { hive, subkey, valueName })),
+	cancelShutdown: () => typedError<null, string>(__TAURI_INVOKE("cancel_shutdown")),
 };
 
 /* Types */
@@ -49,6 +93,16 @@ export type Baseline = {
 	name: string,
 	description: string,
 };
+
+/**
+ *  Which benchmark a project runs. `WorkshopDust2` is the original M1
+ *  benchmark (spec D6 in `docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md`);
+ *  `AveYoCfgV2` is AveYo's MIT-licensed `benchmark.cfg`/`benchmark2.cfg`
+ *  (docs/superpowers/specs/2026-09-09-aveyo-benchmark-design.md). Not a
+ *  `Module` — this is project identity (like `map_id`), with no apply/revert
+ *  or journal entry.
+ */
+export type BenchmarkKind = "workshop_dust2" | "aveyo_cfg_v2";
 
 export type CatalogEntry = {
 	id: string,
@@ -73,6 +127,15 @@ export type CatalogEntry = {
 	 */
 	module_template: unknown,
 	/**
+	 *  The alternate value for a binary registry toggle (e.g. HAGS's
+	 *  `HwSchMode`) -- lets the picker offer whichever direction the live
+	 *  machine isn't already at, instead of blocking as a no-op with no
+	 *  fallback. `None` for every entry that isn't a two-state toggle.
+	 *  Deliberately NOT part of `module_template` -- this is catalog
+	 *  metadata for the picker UI, never a field of the `Module` itself.
+	 */
+	off_value?: unknown,
+	/**
 	 *  `true` if a scenario may contain at most one module of this entry's
 	 *  `kind` (e.g. `power_plan` -- a scenario targets exactly one power
 	 *  plan, so a second one is never meaningful). Enforced by
@@ -80,6 +143,22 @@ export type CatalogEntry = {
 	 *  already-shipped catalog entry needs no change.
 	 */
 	singleton?: boolean,
+	/**
+	 *  Named value choices for a registry entry with more than two
+	 *  meaningful states (e.g. `Win32PrioritySeparation`'s twelve
+	 *  interval/length/PsPrioSep combinations) -- the picker offers these
+	 *  as a dropdown instead of `off_value`'s single-click toggle, and
+	 *  disables whichever choice matches the machine's live value. `None`
+	 *  for every entry that isn't a multi-value picker.
+	 */
+	value_choices?: CatalogValueChoice[] | null,
+};
+
+/**  One dropdown option for `CatalogEntry::value_choices`. */
+export type CatalogValueChoice = {
+	label: string,
+	/**  Same BigInt-export caveat as `CatalogEntry::module_template`. */
+	value: unknown,
 };
 
 export type Check = {
@@ -92,15 +171,30 @@ export type CheckStatus = "pass" | "warn" | "block" | "deferred";
 
 export type Config = {
 	presentmon_path?: string,
-	default_warmup_loops?: number,
-	default_measure_loops?: number,
-	default_capture_seconds?: number,
 	dry_run_default?: boolean,
 	last_known_cs2_build_id?: string | null,
 	/**  HWiNFO64.exe's bundled install location (docs/superpowers/specs/2026-09-05-bundled-tools-alpha-install-design.md §2). */
 	hwinfo_path?: string | null,
 	/**  On by default -- see `default_thermal_cooldown_enabled`. */
 	thermal_cooldown_enabled?: boolean,
+	/**
+	 *  Spec §7 / D3: default state of the countdown modal's "Shut down when
+	 *  the run completes" toggle. Off by default -- an unattended shutdown
+	 *  is an opt-in behavior change to what the machine does on its own.
+	 */
+	shutdown_when_complete_default?: boolean,
+	/**  Spec D5: default `RunConfig::post_boot_settle` in seconds. */
+	post_boot_settle_seconds?: number,
+	/**
+	 *  Whether the user has dismissed the one-time "custom scripts run
+	 *  elevated, VOIDFRAME can't verify what they do" warning -- shown once,
+	 *  the first time they ever add a `custom_script` module, not per-script
+	 *  or per-run (the per-script hash-tracking confirmation gate this used
+	 *  to be was ruled too unpractical for a single-user, locally-run app
+	 *  where the user is always the one who wrote the script in the first
+	 *  place).
+	 */
+	custom_script_warning_seen?: boolean,
 };
 
 export type ControlMsg = "Pause" | "Resume" | "Abort" | 
@@ -114,13 +208,35 @@ export type ControlMsg = "Pause" | "Resume" | "Abort" |
  */
 "OperatorAcknowledged";
 
+export type Cs2ConfigPayload = {
+	settings: { [key in string]: string },
+};
+
+export type Cursor = {
+	/**  0 = baseline, then the enabled scenarios in project order. */
+	index: number,
+	stage: Stage,
+};
+
+export type CustomScriptPayload = {
+	apply_script: string,
+	revert_script: string,
+	requires_reboot?: boolean,
+	description: string,
+};
+
 /**
  *  Which game-synchronisation tier produced a run's captures
  *  (`docs/03-functional-spec.md` §4).
  */
 export type DetectionTier = "log_tail" | "fixed_window";
 
-export type EngineEvent = { type: "PhaseChanged"; phase: Phase } | { type: "LogLine"; text: string } | { type: "IterationStarted"; kind: IterationKind; index: number } | { type: "CapturePending" } | { type: "CaptureResumed" } | 
+export type EngineEvent = { type: "PhaseChanged"; phase: Phase } | { type: "LogLine"; text: string } | { type: "IterationStarted"; kind: IterationKind; index: number } | 
+/**
+ *  One HWiNFO reading taken during the pre-run thermal baseline or a
+ *  cooldown check — drives the UI's live countdown.
+ */
+{ type: "ThermalProgress"; sample: number; total: number; cpu_temp_celsius: number | null; gpu_temp_celsius: number | null } | { type: "CapturePending" } | { type: "CaptureResumed" } | 
 /**
  *  Bracket ONLY the real PresentMon capture call itself (not the settle
  *  sleep before it, not the post-capture wait for the benchmark-ended
@@ -129,7 +245,21 @@ export type EngineEvent = { type: "PhaseChanged"; phase: Phase } | { type: "LogL
  *  once per measure iteration; never sent for a warmup iteration
  *  (warmup never captures).
  */
-{ type: "RecordingStarted" } | { type: "RecordingStopped" } | { type: "IterationComplete"; metrics: Metrics } | { type: "ScenarioComplete"; result: ScenarioResult } | { type: "OperatorPrompt"; text: string } | { type: "RunComplete"; run_id: string } | { type: "RunFailed"; reason: string } | { type: "RollbackProgress"; reverted: number };
+{ type: "RecordingStarted" } | { type: "RecordingStopped" } | { type: "IterationComplete"; metrics: Metrics } | { type: "ScenarioComplete"; result: ScenarioResult } | 
+/**
+ *  Emitted once per non-baseline scenario from `finish_run`, immediately
+ *  after `score_scenarios()` computes its real `wcps`/`verdict` --
+ *  unlike `ScenarioComplete` (fired right when the scenario's own
+ *  measure stage finishes, before the whole run's baseline comparison
+ *  is available), this always carries the final, real score. Exists
+ *  because `run.log`'s own `ScenarioComplete` line was otherwise always
+ *  wrong (see `run_log.rs`'s `format_event`) -- it printed the
+ *  not-yet-scored placeholder (`wcps=0.00 verdict=confirmed_same`) for
+ *  every scenario in every run, contradicting the real `results.json`.
+ *  Confirmed on real alpha-tester data:
+ *  study/pamuk/ab-test-analysis-report.md §3.
+ */
+{ type: "ScenarioScored"; result: ScenarioResult } | { type: "OperatorPrompt"; text: string } | { type: "RunComplete"; run_id: string } | { type: "RunFailed"; reason: string } | { type: "RollbackProgress"; reverted: number };
 
 export type Hive = "HKLM" | "HKCU";
 
@@ -209,9 +339,35 @@ export type Module = {
 	type: "power_plan",
 } & PowerPlanPayload | {
 	type: "affinity_cpu",
-} & AffinityCpuPayload | ({ type: "launch_args"; args: string }) & { setting?: never; sub?: never; value?: never } | ({ type: "unsupported" }) & { args?: never; setting?: never; sub?: never; value?: never };
+} & AffinityCpuPayload | ({ type: "launch_args"; args: string }) & { setting?: never; sub?: never; value?: never } | {
+	type: "custom_script",
+} & CustomScriptPayload | {
+	type: "cs2_config",
+} & Cs2ConfigPayload | ({ type: "unsupported" }) & { args?: never; setting?: never; sub?: never; value?: never };
 
-export type Phase = { kind: "preflight" } | { kind: "snapshot" } | { kind: "thermal_baseline" } | { kind: "baseline" } | { kind: "scenario"; id: string } | { kind: "rollback" } | { kind: "report" };
+export type PendingReboot = {
+	reason: RebootReason,
+	scenario_id: string,
+	initiated_at: string,
+	boot_count: number,
+};
+
+export type Phase = { kind: "preflight" } | { kind: "snapshot" } | { kind: "thermal_baseline" } | 
+/**
+ *  Waiting between scenarios for the machine to cool back down to the
+ *  run's thermal baseline (`maybe_break`'s thermal-mode path) --
+ *  distinct from `ThermalBaseline` itself (that's the one-time pre-run
+ *  reading; a resume must never re-enter it mid-run, see
+ *  `begin_resume_waits_for_cooldown_instead_of_resampling_the_baseline_mid_run`).
+ */
+{ kind: "thermal_cooldown" } | { kind: "baseline" } | { kind: "scenario"; id: string } | 
+/**
+ *  An operator Abort was observed and the run body has been cancelled;
+ *  finalize (process kill, journal revert, teardown) is underway. A
+ *  run-scoped phase: `current_scenario` in the store stays whatever it
+ *  was, so a crash mid-abort still knows which journal was last live.
+ */
+{ kind: "aborting" } | { kind: "reboot_pending"; reason: RebootReason } | { kind: "boot_resume" } | { kind: "rollback" } | { kind: "report" };
 
 export type PowerPlan = {
 	guid: string,
@@ -241,6 +397,14 @@ export type Project = {
 	scenarios?: Scenario[],
 };
 
+export type RebootReason = 
+/**  The scenario at the cursor was applied and needs a boot before it is measured. */
+"apply_next" | 
+/**  The previous scenario's revert needs a boot; nothing is applied. */
+"revert_only" | 
+/**  Previous revert + next apply share this one boot. */
+"revert_and_apply_next";
+
 export type RegType = "DWORD" | "QWORD" | "SZ" | "BINARY" | 
 /**
  *  `REG_EXPAND_SZ`. `#[serde(rename)]` because plain `rename_all =
@@ -266,6 +430,24 @@ export type RegistryPayload = {
 	 *  same specta-typescript escape hatch as `CatalogEntry.module_template`.
 	 */
 	value: unknown,
+	/**
+	 *  The value only takes effect after a reboot (HAGS, `MSISupported`, …).
+	 *  A scenario containing any such module is a reboot scenario
+	 *  (`Scenario::requires_reboot`), which drives the run loop's
+	 *  `plan_transition` and the builder's reboot count.
+	 */
+	requires_reboot?: boolean,
+};
+
+export type RegistryValueView = {
+	present: boolean,
+	/**
+	 *  `{type, value}`, same shape as the journal's own registry records
+	 *  (`voidframe_engine::mutation::registry::value_to_json`) -- untyped
+	 *  for the same reason `RegistryPayload::value` is (its shape depends
+	 *  on the value's registry type).
+	 */
+	value: unknown | null,
 };
 
 /**
@@ -281,6 +463,38 @@ export type RevertReport = {
 	verify_failures: string[],
 };
 
+export type RunProgress = {
+	schema_version: string,
+	run_id: string,
+	project: Project,
+	start_build_id: string | null,
+	start_launch_args: string,
+	start_launch_args_raw: string,
+	start_power_plan: PowerPlan,
+	thermal_baseline: ThermalReading | null,
+	completed: ScenarioResult[],
+	unstable: UnstableScenario[],
+	cursor: Cursor,
+	reboot: PendingReboot | null,
+	shutdown_when_complete: boolean,
+	/**
+	 *  Set by the resume path after a bad boot reverted the scenario at
+	 *  the cursor; the loop's Revert arm skips `revert_stage` once and
+	 *  clears it.
+	 */
+	skip_revert_once?: boolean,
+	/**
+	 *  Set immediately before `scenario_loop` would otherwise call
+	 *  `reboot_sequence` while an operator Abort is pending (`*ctx.abort.
+	 *  borrow()` true), so the reboot is skipped and this run's `Err` exit
+	 *  is durable across a process restart -- see `begin_resume`'s own
+	 *  check of this field. `#[serde(default)]` for the same reason as
+	 *  `skip_revert_once`: every `progress.json` written before this field
+	 *  existed must still parse.
+	 */
+	abort_requested?: boolean,
+};
+
 export type RunResults = {
 	schema_version: string,
 	run_id: string,
@@ -289,6 +503,15 @@ export type RunResults = {
 	detection_tier: DetectionTier,
 	baseline: ScenarioResult,
 	scenarios: ScenarioResult[],
+	/**
+	 *  Scenarios `begin_resume` reverted and set aside after a non-clean
+	 *  boot (spec §4) -- carried over from `RunProgress::unstable` at
+	 *  REPORT, since `progress.json` is removed once a run completes and
+	 *  this is otherwise the only record that they were skipped.
+	 *  `#[serde(default)]` for back-compat with `results.json` files
+	 *  already on disk.
+	 */
+	unstable?: UnstableScenario[],
 };
 
 export type RunState = {
@@ -340,6 +563,18 @@ export type ScenarioResult = {
 	metric_deltas: MetricDelta[],
 	wcps: number | null,
 	verdict: Verdict,
+	/**
+	 *  Spec section 6 / D6: true once this scenario's `custom_script`
+	 *  module completed a revert -- VOIDFRAME ran the script but never
+	 *  verified its actual effect. Can't be set at construction time:
+	 *  `scenario_result` builds this struct during `Stage::Measure`, which
+	 *  runs *before* `Stage::Revert` (and the scenario's own custom_script
+	 *  revert) at all, so `run/execute/mod.rs`'s `Stage::Revert` arm patches
+	 *  this field into the already-recorded result after a real revert
+	 *  completes. `#[serde(default)]` for back-compat with `results.json`
+	 *  files already on disk.
+	 */
+	script_reverted_unverified?: boolean,
 };
 
 /**
@@ -358,6 +593,27 @@ export type Settings = {
 	map_id?: string,
 	watchdog_seconds?: number,
 	netcon_port?: number | null,
+	benchmark_kind?: BenchmarkKind,
+};
+
+export type Stage = "apply" | "measure" | "revert" | "done";
+
+/**
+ *  The result of averaging `sample_count` HWiNFO sensor readings,
+ *  `sample_interval` apart. Persisted verbatim into `thermal.json`
+ *  (`model::thermal::ThermalLog`) -- `Serialize`/`Deserialize` are for that
+ *  file round-trip; it is now also embedded in `RunProgress`, which is
+ *  exposed over IPC.
+ */
+export type ThermalReading = {
+	cpu_temp_celsius: number | null,
+	gpu_temp_celsius: number | null,
+	sample_count: number,
+};
+
+export type UnstableScenario = {
+	scenario_id: string,
+	reason: string,
 };
 
 export type Verdict = "better" | "worse" | "no_measurable_difference" | 

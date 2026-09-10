@@ -18,6 +18,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { commands } from "./bindings";
 import type {
   AffinityCpuPayload,
@@ -38,8 +39,10 @@ import type {
   PreflightReport,
   Project,
   RegistryPayload,
+  RegistryValueView,
   RegType,
   RevertReport,
+  RunProgress,
   RunResults,
   RunState,
   RunSummary,
@@ -72,8 +75,10 @@ export type {
   PreflightReport,
   Project,
   RegistryPayload,
+  RegistryValueView,
   RegType,
   RevertReport,
+  RunProgress,
   RunResults,
   RunState,
   RunSummary,
@@ -159,14 +164,51 @@ export async function readCs2LaunchOptions(): Promise<string> {
   return unwrap(commands.readCs2LaunchOptions());
 }
 
+/** The user's real current cs2_video.txt settings, for pre-filling the
+ * cs2_config builder form on "Add Module" -- mirrors readCs2LaunchOptions'
+ * own live-value-on-add pattern for launch_args. */
+export async function readCs2VideoConfig(): Promise<Record<string, string>> {
+  return unwrap(commands.readCs2VideoConfig());
+}
+
+/** A live registry read, e.g. for the builder's "already your baseline" hint. */
+export async function readRegistryValue(
+  hive: Hive,
+  subkey: string,
+  valueName: string,
+): Promise<RegistryValueView> {
+  return unwrap(commands.readRegistryValue(hive, subkey, valueName));
+}
+
+// --- Custom scripts / cs2_config ---------------------------------------
+
+export async function importCustomScript(
+  projectId: string,
+  sourcePath: string,
+): Promise<string> {
+  return unwrap(commands.importCustomScript(projectId, sourcePath));
+}
+
 // --- Run lifecycle -----------------------------------------------------
 
-export async function startRun(projectId: string, dryRun: boolean): Promise<string> {
-  return unwrap(commands.startRun(projectId, dryRun));
+export async function startRun(
+  projectId: string,
+  dryRun: boolean,
+  shutdownWhenComplete: boolean,
+): Promise<string> {
+  return unwrap(commands.startRun(projectId, dryRun, shutdownWhenComplete));
+}
+
+export async function resumeRun(): Promise<string> {
+  return unwrap(commands.resumeRun());
 }
 
 export async function sendControl(msg: ControlMsg): Promise<void> {
   await unwrap(commands.sendControl(msg));
+}
+
+export async function setShutdownWhenComplete(value: boolean): Promise<void> {
+  await unwrap(commands.setShutdownWhenComplete(value));
 }
 
 export async function getResults(runId: string): Promise<RunResults> {
@@ -179,6 +221,21 @@ export async function listResults(projectId: string): Promise<RunSummary[]> {
 
 export async function getRunSnapshot(): Promise<RunState | null> {
   return unwrap(commands.getRunSnapshot());
+}
+
+/** Whether THIS process launch was a `voidframe.exe --resume` invocation --
+ * a synchronous, race-free fact known at process start (not tied to whether
+ * the backend's own auto-resume has actually finished yet). */
+export async function isResumeLaunch(): Promise<boolean> {
+  return unwrap(commands.isResumeLaunch());
+}
+
+export async function getRunProgress(runId: string): Promise<RunProgress | null> {
+  return unwrap(commands.getRunProgress(runId));
+}
+
+export async function cancelShutdown(): Promise<void> {
+  await unwrap(commands.cancelShutdown());
 }
 
 export async function rollbackNow(): Promise<RevertReport> {
@@ -242,4 +299,14 @@ export async function closeWindow(): Promise<void> {
 
 export async function isWindowMaximized(): Promise<boolean> {
   return invoke("is_window_maximized");
+}
+
+// --- App metadata (built-in Tauri core API, no custom command) ---------
+
+/** The app version Tauri reads from `tauri.conf.json` (itself pointed at
+ * `package.json`) -- the single source of truth for what the title bar
+ * displays, so it can never again drift the way the old hardcoded
+ * `v0.1.0-RC` string did. */
+export async function getAppVersion(): Promise<string> {
+  return getVersion();
 }

@@ -2,7 +2,6 @@
 //! tests. Not exposed outside the crate for anything except testing.
 
 use crate::error::{Error, Result};
-use crate::model::module::Hive;
 use crate::system::*;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -21,7 +20,34 @@ pub struct MockSnapshot {
 struct MockState {
     registry: BTreeMap<String, RegValue>,
     powercfg: BTreeMap<String, AcDc<u32>>,
+    cs2_video_config_path: std::path::PathBuf,
+    cs2_video_config: String,
     plans: Vec<PowerPlan>,
+    /// When `Some(d)`, `duplicate_power_plan` sleeps `d` before it
+    /// registers the new plan -- a real `.await` point inside that call,
+    /// so a test can observe state that only holds *while* the call is in
+    /// flight (`mutation::power_plan`'s `no_return` shield). Without it
+    /// the whole call resolves synchronously on its first poll and no
+    /// other task ever gets a chance to look. `None` (the default) is the
+    /// instant behavior every other test relies on.
+    duplicate_power_plan_delay: Option<std::time::Duration>,
+    /// When `Some(d)`, `write_powercfg` sleeps `d` before it applies the
+    /// value -- a real `.await` point inside the one call a powercfg
+    /// journal record's *revert* makes, so a test can observe state that
+    /// only holds *while* a reverse replay is in flight (`run::execute::
+    /// scenario::revert_stage`'s `no_return` shield). Without it the whole
+    /// replay resolves synchronously and no other task ever gets a chance
+    /// to look. `None` (the default) is the instant behavior every other
+    /// test relies on. Mirrors `duplicate_power_plan_delay`.
+    write_powercfg_delay: Option<std::time::Duration>,
+    /// Optional artificial delay inside every `read_registry` call -- the
+    /// first await of `mutation::registry::apply`, before its journal
+    /// record exists -- so a test can park a run between one module's
+    /// confirmed apply and the next module's first journal line, the exact
+    /// window an operator Abort dropping the run body must still recover
+    /// from. `None` (the default) is the instant behavior every other test
+    /// relies on. Mirrors `write_powercfg_delay`.
+    read_registry_delay: Option<std::time::Duration>,
     topology: CpuTopology,
     gpu_model: String,
     fail_next_write: Option<String>,
@@ -35,7 +61,7 @@ struct MockState {
     write_launch_options_calls: u32,
     processes: BTreeMap<String, ProcHandle>, // name -> discovered handle
     suspended: std::collections::BTreeSet<u32>,
-    reissue_map_calls: Vec<String>,
+    send_console_command_calls: Vec<String>,
     hide_console_calls: u32,
     quit_cs2_calls: u32,
     /// When `true`, `quit_cs2_gracefully` also removes the tracked cs2.exe
@@ -99,6 +125,15 @@ struct MockState {
     /// fixed-time fallback on that path) without a real HWiNFO launch.
     /// `None` (the default) means `start_hwinfo` always succeeds.
     start_hwinfo_failure: Option<String>,
+    /// When `Some(d)`, `start_hwinfo` sleeps `d` before it registers the
+    /// process -- a real `.await` point inside that call, mirroring the real
+    /// controller's spawn-plus-readiness-poll `spawn_blocking`, so a test can
+    /// observe state that only holds *while* the start is in flight (the
+    /// `hwinfo_started` flag being set before the await, not after). Without
+    /// it the whole call resolves on its first poll and that window never
+    /// exists. `None` (the default) is the instant behavior every other test
+    /// relies on. Mirrors `duplicate_power_plan_delay`.
+    start_hwinfo_delay: Option<std::time::Duration>,
     hwinfo_reading: HwinfoSensorSnapshot,
     /// A scripted sequence of successive `read_hwinfo_sensors` results,
     /// consumed front-to-back one per call -- lets a test assert on a real
@@ -134,6 +169,18 @@ struct MockState {
     app_manifest: Option<AppManifest>,
     workshop_item_installed: bool,
     free_disk_bytes: u64,
+    reboot_calls: u32,
+    shutdown_calls: u32,
+    shutdown_failure: Option<String>,
+    cancel_shutdown_calls: u32,
+    reboot_failure: Option<String>,
+    deregister_task_failure: Option<String>,
+    tasks: Vec<TaskSpec>,
+    boot_report: BootReport,
+    bitlocker: BitlockerStatus,
+    inhibit_sleep_calls: Vec<bool>,
+    run_script_calls: Vec<std::path::PathBuf>,
+    run_script_result: Option<Result<ScriptOutput>>,
 }
 
 fn key_str(k: &RegKey) -> String {
@@ -193,7 +240,14 @@ impl MockController {
         MockController(Arc::new(Mutex::new(MockState {
             registry: BTreeMap::new(),
             powercfg: BTreeMap::new(),
+            cs2_video_config_path: std::path::PathBuf::from(
+                r"C:\Program Files (x86)\Steam\userdata\12345678\730\local\cfg\cs2_video.txt",
+            ),
+            cs2_video_config: String::new(),
             plans: default_plans(),
+            duplicate_power_plan_delay: None,
+            write_powercfg_delay: None,
+            read_registry_delay: None,
             topology: default_topology(),
             gpu_model: "Mock GPU".to_string(),
             fail_next_write: None,
@@ -205,7 +259,7 @@ impl MockController {
             write_launch_options_calls: 0,
             processes: BTreeMap::new(),
             suspended: std::collections::BTreeSet::new(),
-            reissue_map_calls: Vec::new(),
+            send_console_command_calls: Vec::new(),
             hide_console_calls: 0,
             quit_cs2_calls: 0,
             quit_removes_process: false,
@@ -223,6 +277,7 @@ impl MockController {
             start_hwinfo_calls: 0,
             close_hwinfo_calls: 0,
             start_hwinfo_failure: None,
+            start_hwinfo_delay: None,
             hwinfo_reading: HwinfoSensorSnapshot {
                 cpu_temp_celsius: 50.0,
                 gpu_temp_celsius: None,
@@ -237,16 +292,23 @@ impl MockController {
             }),
             workshop_item_installed: true,
             free_disk_bytes: 50_000_000_000,
+            reboot_calls: 0,
+            shutdown_calls: 0,
+            shutdown_failure: None,
+            cancel_shutdown_calls: 0,
+            reboot_failure: None,
+            deregister_task_failure: None,
+            tasks: Vec::new(),
+            boot_report: BootReport::default(),
+            bitlocker: BitlockerStatus::Off,
+            inhibit_sleep_calls: Vec::new(),
+            run_script_calls: Vec::new(),
+            run_script_result: None,
         })))
     }
 
-    pub fn with_registry(self, hive: Hive, subkey: &str, name: &str, v: RegValue) -> Self {
-        let k = RegKey {
-            hive,
-            subkey: subkey.into(),
-            value_name: name.into(),
-        };
-        self.0.lock().unwrap().registry.insert(key_str(&k), v);
+    pub fn with_registry(self, k: &RegKey, v: RegValue) -> Self {
+        self.0.lock().unwrap().registry.insert(key_str(k), v);
         self
     }
     pub fn with_powercfg(self, sub: &str, setting: &str, v: AcDc<u32>) -> Self {
@@ -257,8 +319,38 @@ impl MockController {
             .insert(pc_str(sub, setting), v);
         self
     }
+    pub fn with_cs2_video_config(self, text: &str) -> Self {
+        self.0.lock().unwrap().cs2_video_config = text.to_string();
+        self
+    }
+    pub fn with_cs2_video_config_path(self, path: &str) -> Self {
+        self.0.lock().unwrap().cs2_video_config_path = std::path::PathBuf::from(path);
+        self
+    }
+    pub fn with_run_script_result(self, r: Result<ScriptOutput>) -> Self {
+        self.0.lock().unwrap().run_script_result = Some(r);
+        self
+    }
+    pub fn run_script_calls(&self) -> Vec<std::path::PathBuf> {
+        self.0.lock().unwrap().run_script_calls.clone()
+    }
     pub fn with_topology(self, t: CpuTopology) -> Self {
         self.0.lock().unwrap().topology = t;
+        self
+    }
+    /// See `MockState::duplicate_power_plan_delay`.
+    pub fn with_duplicate_power_plan_delay(self, d: std::time::Duration) -> Self {
+        self.0.lock().unwrap().duplicate_power_plan_delay = Some(d);
+        self
+    }
+    /// See `MockState::write_powercfg_delay`.
+    pub fn with_write_powercfg_delay(self, d: std::time::Duration) -> Self {
+        self.0.lock().unwrap().write_powercfg_delay = Some(d);
+        self
+    }
+    /// See `MockState::read_registry_delay`.
+    pub fn with_read_registry_delay(self, d: std::time::Duration) -> Self {
+        self.0.lock().unwrap().read_registry_delay = Some(d);
         self
     }
     pub fn with_power_plans(self, p: Vec<PowerPlan>) -> Self {
@@ -362,6 +454,11 @@ impl MockController {
         self.0.lock().unwrap().start_hwinfo_failure = Some(msg.to_string());
         self
     }
+    /// See `MockState::start_hwinfo_delay`.
+    pub fn with_start_hwinfo_delay(self, d: std::time::Duration) -> Self {
+        self.0.lock().unwrap().start_hwinfo_delay = Some(d);
+        self
+    }
     /// The next mutation call (`write_registry` / `write_powercfg` /
     /// `set_active_power_plan`) returns `Error::mock(msg)` once, then clears.
     pub fn fail_next_write(&self, msg: &str) {
@@ -383,9 +480,9 @@ impl MockController {
                 .unwrap_or_default(),
         }
     }
-    /// Every `reissue_map` call so far, in call order.
-    pub fn reissue_map_calls(&self) -> Vec<String> {
-        self.0.lock().unwrap().reissue_map_calls.clone()
+    /// Every `send_console_command` call so far, in call order.
+    pub fn send_console_command_calls(&self) -> Vec<String> {
+        self.0.lock().unwrap().send_console_command_calls.clone()
     }
     /// How many times `hide_console` has been called so far.
     pub fn hide_console_calls(&self) -> u32 {
@@ -452,6 +549,12 @@ impl MockController {
     pub fn close_hwinfo_calls(&self) -> u32 {
         self.0.lock().unwrap().close_hwinfo_calls
     }
+    /// How many times `read_hwinfo_sensors` has been called so far -- lets a
+    /// test prove a sample loop is genuinely partway through its
+    /// `sample_count` reads (not just started or finished).
+    pub fn hwinfo_read_calls(&self) -> u32 {
+        self.0.lock().unwrap().hwinfo_read_calls
+    }
     pub fn with_steam_install_path(self, path: &str) -> Self {
         self.0.lock().unwrap().steam_install_path = std::path::PathBuf::from(path);
         self
@@ -468,11 +571,60 @@ impl MockController {
         self.0.lock().unwrap().free_disk_bytes = bytes;
         self
     }
+    /// The next `reboot` call returns `Error::mock(msg)`.
+    pub fn with_reboot_failing(self, msg: &str) -> Self {
+        self.0.lock().unwrap().reboot_failure = Some(msg.to_string());
+        self
+    }
+    pub fn reboot_calls(&self) -> u32 {
+        self.0.lock().unwrap().reboot_calls
+    }
+    /// Every `deregister_task` call returns `Error::mock(msg)`, persisting
+    /// across calls (mirrors `with_reboot_failing`'s one-field, always-on
+    /// semantics rather than `fail_next_write`'s one-shot behavior).
+    pub fn with_deregister_task_failing(self, msg: &str) -> Self {
+        self.0.lock().unwrap().deregister_task_failure = Some(msg.to_string());
+        self
+    }
+    pub fn shutdown_calls(&self) -> u32 {
+        self.0.lock().unwrap().shutdown_calls
+    }
+    /// Every `shutdown` call returns `Error::mock(msg)` (mirrors
+    /// `with_reboot_failing`).
+    pub fn with_shutdown_failing(self, msg: &str) -> Self {
+        self.0.lock().unwrap().shutdown_failure = Some(msg.to_string());
+        self
+    }
+    pub fn cancel_shutdown_calls(&self) -> u32 {
+        self.0.lock().unwrap().cancel_shutdown_calls
+    }
+    /// Every scheduled task currently registered.
+    pub fn registered_tasks(&self) -> Vec<TaskSpec> {
+        self.0.lock().unwrap().tasks.clone()
+    }
+    pub fn with_boot_report(self, r: BootReport) -> Self {
+        self.0.lock().unwrap().boot_report = r;
+        self
+    }
+    pub fn with_bitlocker(self, s: BitlockerStatus) -> Self {
+        self.0.lock().unwrap().bitlocker = s;
+        self
+    }
+    /// Every `on` value passed to `inhibit_sleep` so far, in call order.
+    pub fn inhibit_sleep_calls(&self) -> Vec<bool> {
+        self.0.lock().unwrap().inhibit_sleep_calls.clone()
+    }
 }
 
 #[async_trait]
 impl SystemController for MockController {
     async fn read_registry(&self, k: &RegKey) -> Result<RegValue> {
+        // Read and release the lock before any `.await` -- a `std::sync`
+        // guard must never be held across one.
+        let delay = self.0.lock().unwrap().read_registry_delay;
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
         Ok(self
             .0
             .lock()
@@ -517,12 +669,44 @@ impl SystemController for MockController {
         if let Some(m) = self.take_fail() {
             return Err(Error::mock(m));
         }
+        // Read and release the lock before any `.await` -- a `std::sync`
+        // guard must never be held across one.
+        let delay = self.0.lock().unwrap().write_powercfg_delay;
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
         self.0
             .lock()
             .unwrap()
             .powercfg
             .insert(pc_str(sub, setting), AcDc { ac: v, dc: v });
         Ok(())
+    }
+    async fn find_cs2_video_config_path(&self) -> Result<std::path::PathBuf> {
+        Ok(self.0.lock().unwrap().cs2_video_config_path.clone())
+    }
+    async fn read_cs2_video_config(&self) -> Result<String> {
+        Ok(self.0.lock().unwrap().cs2_video_config.clone())
+    }
+    async fn write_cs2_video_config(&self, text: &str) -> Result<()> {
+        self.0.lock().unwrap().cs2_video_config = text.to_string();
+        Ok(())
+    }
+    async fn run_script(
+        &self,
+        path: &std::path::Path,
+        _timeout: std::time::Duration,
+    ) -> Result<ScriptOutput> {
+        let mut state = self.0.lock().unwrap();
+        state.run_script_calls.push(path.to_path_buf());
+        if let Some(scripted) = state.run_script_result.take() {
+            return scripted;
+        }
+        Ok(ScriptOutput {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
     }
     async fn list_power_plans(&self) -> Result<Vec<PowerPlan>> {
         Ok(self.0.lock().unwrap().plans.clone())
@@ -555,6 +739,12 @@ impl SystemController for MockController {
         template_guid: &str,
         _c: &MutationCtx,
     ) -> Result<PowerPlan> {
+        // Read and release the lock before any `.await` -- a `std::sync`
+        // guard must never be held across one.
+        let delay = self.0.lock().unwrap().duplicate_power_plan_delay;
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
         let mut s = self.0.lock().unwrap();
         let name = s
             .plans
@@ -667,12 +857,12 @@ impl SystemController for MockController {
         s.killed_pids.push(pid);
         Ok(())
     }
-    async fn reissue_map(&self, map_command: &str) -> Result<()> {
+    async fn send_console_command(&self, command: &str) -> Result<()> {
         self.0
             .lock()
             .unwrap()
-            .reissue_map_calls
-            .push(map_command.to_string());
+            .send_console_command_calls
+            .push(command.to_string());
         Ok(())
     }
     async fn hide_console(&self) -> Result<()> {
@@ -706,8 +896,17 @@ impl SystemController for MockController {
         Ok(self.find_process("HWiNFO64.exe").await?.is_some())
     }
     async fn start_hwinfo(&self, _path: &std::path::Path) -> Result<()> {
+        // Counted, then the lock released before any `.await` -- a
+        // `std::sync` guard must never be held across one.
+        let delay = {
+            let mut s = self.0.lock().unwrap();
+            s.start_hwinfo_calls += 1;
+            s.start_hwinfo_delay
+        };
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
         let mut s = self.0.lock().unwrap();
-        s.start_hwinfo_calls += 1;
         if let Some(msg) = s.start_hwinfo_failure.clone() {
             return Err(Error::mock(msg));
         }
@@ -754,11 +953,60 @@ impl SystemController for MockController {
     async fn free_disk_bytes(&self) -> Result<u64> {
         Ok(self.0.lock().unwrap().free_disk_bytes)
     }
+    async fn reboot(&self, _delay_secs: u32, _message: &str) -> Result<()> {
+        let mut s = self.0.lock().unwrap();
+        s.reboot_calls += 1;
+        if let Some(msg) = s.reboot_failure.clone() {
+            return Err(Error::mock(msg));
+        }
+        Ok(())
+    }
+    async fn shutdown(&self, _delay_secs: u32, _message: &str) -> Result<()> {
+        let mut s = self.0.lock().unwrap();
+        s.shutdown_calls += 1;
+        if let Some(msg) = s.shutdown_failure.clone() {
+            return Err(Error::mock(msg));
+        }
+        Ok(())
+    }
+    async fn cancel_shutdown(&self) -> Result<()> {
+        self.0.lock().unwrap().cancel_shutdown_calls += 1;
+        Ok(())
+    }
+    async fn register_task(&self, spec: &TaskSpec) -> Result<()> {
+        let mut s = self.0.lock().unwrap();
+        s.tasks.retain(|t| t.name != spec.name);
+        s.tasks.push(spec.clone());
+        Ok(())
+    }
+    async fn deregister_task(&self, name: &str) -> Result<()> {
+        let mut s = self.0.lock().unwrap();
+        if let Some(msg) = s.deregister_task_failure.clone() {
+            return Err(Error::mock(msg));
+        }
+        s.tasks.retain(|t| t.name != name);
+        Ok(())
+    }
+    async fn task_exists(&self, name: &str) -> Result<bool> {
+        Ok(self.0.lock().unwrap().tasks.iter().any(|t| t.name == name))
+    }
+    async fn boot_report(&self, _since: std::time::SystemTime) -> Result<BootReport> {
+        Ok(self.0.lock().unwrap().boot_report.clone())
+    }
+    async fn bitlocker_protection(&self) -> Result<BitlockerStatus> {
+        Ok(self.0.lock().unwrap().bitlocker)
+    }
+    async fn inhibit_sleep(&self, on: bool) -> Result<()> {
+        self.0.lock().unwrap().inhibit_sleep_calls.push(on);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::module::Hive;
+    use std::time::Duration;
 
     fn ctx() -> MutationCtx {
         MutationCtx {
@@ -860,6 +1108,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_cs2_video_config_returns_the_seeded_text() {
+        let m = MockController::new().with_cs2_video_config("setting.defaultres 1920\n");
+        assert_eq!(
+            m.read_cs2_video_config().await.unwrap(),
+            "setting.defaultres 1920\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_cs2_video_config_path_returns_the_seeded_path() {
+        let m = MockController::new()
+            .with_cs2_video_config_path(r"D:\Steam\userdata\1\730\local\cfg\cs2_video.txt");
+        assert_eq!(
+            m.find_cs2_video_config_path().await.unwrap(),
+            std::path::PathBuf::from(r"D:\Steam\userdata\1\730\local\cfg\cs2_video.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_cs2_video_config_path_has_a_sensible_default() {
+        let m = MockController::new();
+        let path = m.find_cs2_video_config_path().await.unwrap();
+        assert!(path.to_string_lossy().ends_with("cs2_video.txt"));
+    }
+
+    #[tokio::test]
+    async fn write_cs2_video_config_updates_what_read_returns() {
+        let m = MockController::new().with_cs2_video_config("old\n");
+        m.write_cs2_video_config("new\n").await.unwrap();
+        assert_eq!(m.read_cs2_video_config().await.unwrap(), "new\n");
+    }
+
+    #[tokio::test]
     async fn find_process_returns_none_when_not_registered() {
         let m = MockController::new().with_process("cs2.exe", 4242);
         assert_eq!(
@@ -870,12 +1151,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reissue_map_records_every_call_in_order() {
+    async fn send_console_command_records_every_call_in_order() {
         let m = MockController::new();
-        m.reissue_map("map de_dust2").await.unwrap();
-        m.reissue_map("map de_mirage").await.unwrap();
+        m.send_console_command("map de_dust2").await.unwrap();
+        m.send_console_command("map de_mirage").await.unwrap();
         assert_eq!(
-            m.reissue_map_calls(),
+            m.send_console_command_calls(),
             vec!["map de_dust2".to_string(), "map de_mirage".to_string()]
         );
     }
@@ -993,5 +1274,115 @@ mod tests {
         assert_eq!(m.app_manifest(730).await.unwrap(), None);
         assert!(!m.workshop_item_installed(730, "3240880604").await.unwrap());
         assert_eq!(m.free_disk_bytes().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn reboot_and_shutdown_are_counted_and_never_executed() {
+        let m = MockController::new();
+        m.reboot(10, "restarting for HAGS").await.unwrap();
+        m.shutdown(60, "run complete").await.unwrap();
+        m.cancel_shutdown().await.unwrap();
+        assert_eq!(m.reboot_calls(), 1);
+        assert_eq!(m.shutdown_calls(), 1);
+        assert_eq!(m.cancel_shutdown_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn reboot_can_be_scripted_to_fail() {
+        let m = MockController::new().with_reboot_failing("no shutdown privilege");
+        let err = m.reboot(10, "x").await.unwrap_err();
+        assert!(err.to_string().contains("no shutdown privilege"));
+    }
+
+    #[tokio::test]
+    async fn boot_report_defaults_to_a_clean_boot_and_can_be_scripted() {
+        let m = MockController::new();
+        let r = m
+            .boot_report(std::time::SystemTime::UNIX_EPOCH)
+            .await
+            .unwrap();
+        assert_eq!(r, BootReport::default());
+        let scripted = BootReport {
+            kernel_power_41: true,
+            bugcheck_1001: true,
+            new_minidumps: vec![std::path::PathBuf::from(r"C:\Windows\Minidump\a.dmp")],
+            safeboot_option: None,
+        };
+        let m = MockController::new().with_boot_report(scripted.clone());
+        assert_eq!(
+            m.boot_report(std::time::SystemTime::UNIX_EPOCH)
+                .await
+                .unwrap(),
+            scripted
+        );
+    }
+
+    #[tokio::test]
+    async fn bitlocker_defaults_off_and_sleep_inhibition_is_recorded() {
+        let m = MockController::new();
+        assert_eq!(
+            m.bitlocker_protection().await.unwrap(),
+            BitlockerStatus::Off
+        );
+        let m = MockController::new().with_bitlocker(BitlockerStatus::On);
+        assert_eq!(m.bitlocker_protection().await.unwrap(), BitlockerStatus::On);
+        m.inhibit_sleep(true).await.unwrap();
+        m.inhibit_sleep(false).await.unwrap();
+        assert_eq!(m.inhibit_sleep_calls(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn tasks_register_deregister_and_report_existence() {
+        let m = MockController::new();
+        let spec = TaskSpec {
+            name: RESUME_TASK_NAME.into(),
+            description: "run r1".into(),
+            trigger: TaskTrigger::AtLogonOfCurrentUser,
+            principal: TaskPrincipal::CurrentUserHighest,
+            exe: std::path::PathBuf::from(r"C:\VOIDFRAME\voidframe.exe"),
+            args: "--resume".into(),
+        };
+        assert!(!m.task_exists(RESUME_TASK_NAME).await.unwrap());
+        m.register_task(&spec).await.unwrap();
+        assert!(m.task_exists(RESUME_TASK_NAME).await.unwrap());
+        assert_eq!(m.registered_tasks(), vec![spec.clone()]);
+        // Re-registering the same name replaces, never duplicates.
+        m.register_task(&spec).await.unwrap();
+        assert_eq!(m.registered_tasks().len(), 1);
+        m.deregister_task(RESUME_TASK_NAME).await.unwrap();
+        assert!(!m.task_exists(RESUME_TASK_NAME).await.unwrap());
+        // Deregistering an absent task is Ok (idempotent cleanup).
+        m.deregister_task(RESUME_TASK_NAME).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_script_succeeds_by_default_and_records_the_call() {
+        let m = MockController::new();
+        let out = m
+            .run_script(
+                std::path::Path::new("C:\\scripts\\apply.bat"),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(
+            m.run_script_calls(),
+            vec![std::path::PathBuf::from("C:\\scripts\\apply.bat")]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_script_can_be_scripted_to_fail() {
+        let m =
+            MockController::new().with_run_script_result(Err(Error::mock("nonzero exit".into())));
+        let err = m
+            .run_script(
+                std::path::Path::new("C:\\scripts\\apply.bat"),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nonzero exit"));
     }
 }

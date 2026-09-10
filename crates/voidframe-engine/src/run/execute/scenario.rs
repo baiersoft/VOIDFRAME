@@ -5,16 +5,19 @@
 //! `super::execute`.
 
 use super::RunContext;
-use super::control::{abortable, honor_pause};
+use super::control::honor_pause;
 use super::launch::{is_ready_marker, prepare_cs2_session, wait_for_menu_ready};
 use super::steam::{graceful_kill_cs2, kill_process_tree, wait_for_process};
 use crate::capture::runner::CaptureRunner;
 use crate::cs2::detection::{Cs2LogDetector, DetectionEvent, RealLogTail, Signatures};
 use crate::error::{Error, Result};
 use crate::journal::Journal;
+use crate::journal::replay::RevertReport;
 use crate::model::project::Scenario;
 use crate::model::results::{Metrics, ScenarioResult};
-use crate::model::{AffinityCpuPayload, Module, Settings};
+use crate::model::settings::AVEYO_SETTLE_SECONDS;
+use crate::model::{AffinityCpuPayload, BenchmarkKind, Module, Settings};
+use crate::no_return::NoReturnGuard;
 use crate::run::{ControlMsg, EngineEvent, IterationKind};
 use crate::system::{Cs2LaunchSpec, SystemController};
 use std::path::{Path, PathBuf};
@@ -29,42 +32,52 @@ use tokio::sync::mpsc;
 async fn open_log_tail(
     path: &Path,
     sigs: &Signatures,
+    kind: BenchmarkKind,
     mock: Option<Duration>,
 ) -> Result<Box<dyn Cs2LogDetector>> {
     if let Some(event_delay) = mock {
         Ok(Box::new(crate::mock_harness::MockLogTail::new(event_delay)))
     } else {
-        Ok(Box::new(RealLogTail::open(path, sigs).await?))
+        Ok(Box::new(RealLogTail::open(path, sigs, kind).await?))
     }
 }
 
-/// Runs one scenario (baseline included — `is_baseline` distinguishes it
-/// for reporting only, the mechanics are identical since baseline's
-/// `apply_scenario` is a no-op over zero modules) end to end: CS2 launch,
-/// warmup + measure iterations, kill, and returns the aggregated
-/// `ScenarioResult`.
-pub(super) async fn run_scenario(
-    sys: &dyn SystemController,
-    capture: &dyn CaptureRunner,
-    scenario: &Scenario,
-    is_baseline: bool,
-    ctx: &RunContext<'_>,
-    events: &mpsc::Sender<EngineEvent>,
-    control: &mut mpsc::Receiver<ControlMsg>,
-) -> Result<ScenarioResult> {
-    // --- APPLY_MODULES (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §7.1) ---
-    // Real registry/powercfg/power_plan mutations apply now, while CS2 is
-    // closed; affinity_cpu and launch_args are no-ops here (they apply at
-    // CS2 launch, below) — this exactly matches mutation::apply_module's
-    // EXISTING behavior
-    // (`docs/superpowers/plans/2026-09-01-m1-phase-1-engine-foundation.md`),
-    // no change needed to that function.
-    let journal_path = ctx
-        .config
+/// The per-scenario journal path (`journal-<scenario_id>.jsonl`) under this
+/// run's data-root directory — shared by [`apply_stage`] and
+/// [`revert_stage`] so both agree on the same file.
+pub(super) fn journal_path_for(ctx: &RunContext<'_>, scenario_id: &str) -> PathBuf {
+    ctx.config
         .data_root
         .join("runs")
         .join(&ctx.config.run_id)
-        .join(format!("journal-{}.jsonl", scenario.id));
+        .join(format!("journal-{scenario_id}.jsonl"))
+}
+
+/// This run's own project directory (`<data_root>/projects/<project_id>/`)
+/// -- where a `custom_script` module's `scripts/` subdirectory lives. Shared
+/// by [`apply_stage`]/[`revert_stage`] (via `mutation::apply_scenario`/
+/// `revert_scenario`) so both resolve a `Module::CustomScript`'s
+/// `apply_script`/`revert_script` against the same directory.
+pub(super) fn project_dir_for(ctx: &RunContext<'_>) -> PathBuf {
+    ctx.config
+        .data_root
+        .join("projects")
+        .join(&ctx.config.project.id)
+}
+
+/// APPLY_MODULES (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §7.1): real registry/powercfg/power_plan
+/// mutations apply now, while CS2 is closed; affinity_cpu and launch_args
+/// are no-ops here (they apply at CS2 launch, in `run_scenario_inner`) —
+/// this exactly matches mutation::apply_module's EXISTING behavior
+/// (`docs/superpowers/plans/2026-09-01-m1-phase-1-engine-foundation.md`),
+/// no change needed to that function.
+pub(super) async fn apply_stage(
+    sys: &dyn SystemController,
+    scenario: &Scenario,
+    ctx: &RunContext<'_>,
+    events: &mpsc::Sender<EngineEvent>,
+) -> Result<()> {
+    let journal_path = journal_path_for(ctx, &scenario.id);
     let mut journal = Journal::open(&journal_path)?;
     events
         .send(EngineEvent::LogLine {
@@ -72,32 +85,52 @@ pub(super) async fn run_scenario(
         })
         .await
         .ok();
-    if let Err(e) =
-        crate::mutation::apply_scenario(scenario, &ctx.config.run_id, sys, &mut journal).await
+    if let Err(e) = crate::mutation::apply_scenario(
+        scenario,
+        &ctx.config.run_id,
+        &project_dir_for(ctx),
+        sys,
+        &mut journal,
+        &ctx.no_return,
+    )
+    .await
     {
         // docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §10: "Mutation fails mid-APPLY_MODULES -> Stop the scenario,
         // mark it errored, reverse-replay this scenario's entries, continue
         // to next scenario."
         drop(journal);
-        let _ = crate::mutation::revert_scenario(&scenario.id, &journal_path, sys).await;
+        // Unshielded, unlike `revert_stage`'s replay (I1, 2026-09-07/08
+        // follow-up review) -- an Abort dropping the body here is a smaller
+        // exposure, not a new one: the cursor is still `Stage::Apply`, which
+        // `rollback::in_flight_journal` DOES force-revert, and this scenario's
+        // journal necessarily has an unconfirmed record too (that's why
+        // `apply_scenario` returned `Err`), so `sweep_journals` covers it as
+        // well. Left unshielded rather than guarded preemptively; revisit if
+        // this file's abort-safety story is audited again.
+        let _ = crate::mutation::revert_scenario(
+            &scenario.id,
+            &project_dir_for(ctx),
+            &journal_path,
+            sys,
+        )
+        .await;
         return Err(e);
     }
-    drop(journal); // flush/close before revert_scenario re-opens it for replay
+    Ok(())
+}
 
-    // Everything from here on (the build-freeze re-check included — see
-    // `run_scenario_inner`'s own doc comment for why it moved there) needs
-    // uniform cleanup on failure: if CS2 has been launched, it must be
-    // killed; either way this scenario's journal must be reverted. The
-    // plan's own illustrative sketch only wires that cleanup for the
-    // APPLY_MODULES failure above — anything failing after that (the
-    // build-freeze check, an operator Abort, an iteration failure
-    // including a watchdog hard failure) would otherwise skip both the
-    // kill and the revert entirely, leaving CS2 orphaned and this
-    // scenario's mutations un-reverted. A plain `?` chain can't recover
-    // control to run that cleanup, so this delegates to
-    // `run_scenario_inner`, threading through an out-param for "what pid,
-    // if any, is still alive" so the caller always knows what (if
-    // anything) still needs killing.
+/// The build-freeze re-check through "CS2 killed, detection channel
+/// closed" — delegates to `run_scenario_inner`, killing whatever CS2
+/// process (if any) is still alive on failure so the caller's own
+/// journal revert always runs against a clean process tree.
+pub(super) async fn measure_stage(
+    sys: &dyn SystemController,
+    capture: &dyn CaptureRunner,
+    scenario: &Scenario,
+    ctx: &RunContext<'_>,
+    events: &mpsc::Sender<EngineEvent>,
+    control: &mut mpsc::Receiver<ControlMsg>,
+) -> Result<Vec<Metrics>> {
     let mut launched_pid: Option<u32> = None;
     let inner_result = run_scenario_inner(
         sys,
@@ -109,20 +142,126 @@ pub(super) async fn run_scenario(
         &mut launched_pid,
     )
     .await;
-
     if inner_result.is_err()
         && let Some(pid) = launched_pid
     {
         let _ = kill_process_tree(sys, pid).await;
     }
+    inner_result
+}
 
+/// Reverse-replays this scenario's journal, unconditionally (called
+/// whether [`measure_stage`] succeeded or failed) — see [`run_scenario`]'s
+/// doc comment for why cleanup must always run.
+///
+/// The entire function body is shielded from the whole-body abort race by
+/// [`NoReturnGuard`] (I1, 2026-09-07 follow-up review; widened to cover this
+/// function's own progress LogLine too after a 2026-09-08 re-review found an
+/// Abort landing on that `events.send(..).await` — the channel is bounded,
+/// so it is not always instantly `Ready` — reached the identical unrecoverable
+/// state via one door earlier). The UI still offers Abort during
+/// `Phase::Scenario`/`Phase::Baseline`, correctly — this is ordinary,
+/// cancellable work in every other respect — but an Abort landing *inside*
+/// the replay (or, before this widening, on the LogLine send immediately
+/// before it) would drop the body with the journal only partly reverted (or,
+/// for the LogLine window, not yet touched, with `progress.cursor` already
+/// persisted at `Stage::Revert`), and `revert_all` does not clear a record's
+/// `applied` flag, so that state is indistinguishable from a fully-applied,
+/// never-reverted journal. That ambiguity is exactly why
+/// `rollback::in_flight_journal` refuses to force-revert a `Stage::Revert`
+/// cursor at all, i.e. why the window would be unrecoverable by anything
+/// short of Emergency Restore. Shielding the whole function makes it atomic
+/// with respect to cancellation instead: an Abort observed anywhere in it is
+/// *deferred* by `control::wait_for_abort_allowed` (the shield is
+/// resettable, not a one-shot switch) and acted on the instant this function
+/// returns — the very next abort checkpoint in `scenario_loop`, or the
+/// top-level race itself.
+pub(super) async fn revert_stage(
+    sys: &dyn SystemController,
+    scenario: &Scenario,
+    ctx: &RunContext<'_>,
+    events: &mpsc::Sender<EngineEvent>,
+) -> Result<RevertReport> {
+    let _shield = NoReturnGuard::engage(&ctx.no_return);
+    let journal_path = journal_path_for(ctx, &scenario.id);
     events
         .send(EngineEvent::LogLine {
             text: format!("Reverting modules for scenario '{}'", scenario.name),
         })
         .await
         .ok();
-    let revert_report = crate::mutation::revert_scenario(&scenario.id, &journal_path, sys).await;
+    let report =
+        crate::mutation::revert_scenario(&scenario.id, &project_dir_for(ctx), &journal_path, sys)
+            .await?;
+    if !report.verify_failures.is_empty() {
+        // docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §6.2: never swallowed — recorded, but scenario still
+        // produces a result (the run continues; the header banner /
+        // results.json surfacing happens at the run/report level, not
+        // aborted here).
+        tracing::warn!(
+            scenario = %scenario.id,
+            failures = ?report.verify_failures,
+            "rollback verify mismatch"
+        );
+        events
+            .send(EngineEvent::LogLine {
+                text: format!(
+                    "Rollback verify mismatch for scenario '{}': {:?}",
+                    scenario.name, report.verify_failures
+                ),
+            })
+            .await
+            .ok();
+    }
+    Ok(report)
+}
+
+/// Aggregates + scores (§8) a scenario's per-iteration measurements into
+/// its final `ScenarioResult`.
+pub(super) fn scenario_result(
+    scenario: &Scenario,
+    is_baseline: bool,
+    per_iteration: Vec<Metrics>,
+) -> Result<ScenarioResult> {
+    let aggregated = crate::stats::aggregate_iterations(&per_iteration)?;
+    Ok(ScenarioResult {
+        scenario_id: scenario.id.clone(),
+        name: scenario.name.clone(),
+        is_baseline,
+        aggregated,
+        per_iteration,
+        metric_deltas: vec![], // filled in at the run/report level once baseline exists to compare against
+        wcps: 0.0,             // same
+        verdict: crate::model::results::Verdict::ConfirmedSame, // placeholder, filled in by score_scenarios (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §8) -- see that function's own doc comment for why the baseline's own entry keeps this value unchanged
+        // Stage::Measure (here) runs before Stage::Revert -- the real
+        // revert hasn't happened yet, so this starts false and is patched
+        // to true afterward in run/execute/mod.rs's Stage::Revert arm.
+        script_reverted_unverified: false,
+    })
+}
+
+/// Runs one scenario (baseline included — `is_baseline` distinguishes it
+/// for reporting only, the mechanics are identical since baseline's
+/// `apply_scenario` is a no-op over zero modules) end to end: CS2 launch,
+/// warmup + measure iterations, kill, and returns the aggregated
+/// `ScenarioResult`. Test-only since the cursor-driven run loop
+/// (`super::scenario_loop`) calls [`apply_stage`]/[`measure_stage`]/
+/// [`revert_stage`] directly so it can stop between them at a reboot
+/// boundary -- kept for the many existing tests that still exercise a
+/// scenario's whole apply-measure-revert lifecycle in one call.
+#[cfg(test)]
+pub(super) async fn run_scenario(
+    sys: &dyn SystemController,
+    capture: &dyn CaptureRunner,
+    scenario: &Scenario,
+    is_baseline: bool,
+    ctx: &RunContext<'_>,
+    events: &mpsc::Sender<EngineEvent>,
+    control: &mut mpsc::Receiver<ControlMsg>,
+) -> Result<ScenarioResult> {
+    apply_stage(sys, scenario, ctx, events).await?;
+    let inner_result = measure_stage(sys, capture, scenario, ctx, events, control).await;
+    let revert_report = revert_stage(sys, scenario, ctx, events).await;
 
     if inner_result.is_err() && revert_report.is_err() {
         // `?` below can only propagate ONE error — the scenario's own
@@ -152,42 +291,9 @@ pub(super) async fn run_scenario(
              journal left in place for manual rollback"
         )));
     }
-
     let per_iteration_measure = inner_result?;
-    let revert_report = revert_report?;
-    if !revert_report.verify_failures.is_empty() {
-        // docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §6.2: never swallowed — recorded, but scenario still
-        // produces a result (the run continues; the header banner /
-        // results.json surfacing happens at the run/report level, not
-        // aborted here).
-        tracing::warn!(
-            scenario = %scenario.id,
-            failures = ?revert_report.verify_failures,
-            "rollback verify mismatch"
-        );
-        events
-            .send(EngineEvent::LogLine {
-                text: format!(
-                    "Rollback verify mismatch for scenario '{}': {:?}",
-                    scenario.name, revert_report.verify_failures
-                ),
-            })
-            .await
-            .ok();
-    }
-
-    // --- Aggregate + score (§8) ---
-    let aggregated = crate::stats::aggregate_iterations(&per_iteration_measure)?;
-    Ok(ScenarioResult {
-        scenario_id: scenario.id.clone(),
-        name: scenario.name.clone(),
-        is_baseline,
-        aggregated,
-        per_iteration: per_iteration_measure,
-        metric_deltas: vec![], // filled in at the run/report level once baseline exists to compare against
-        wcps: 0.0,             // same
-        verdict: crate::model::results::Verdict::ConfirmedSame, // placeholder, filled in by score_scenarios (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §8) -- see that function's own doc comment for why the baseline's own entry keeps this value unchanged
-    })
+    revert_report?;
+    scenario_result(scenario, is_baseline, per_iteration_measure)
 }
 
 /// Everything from the build-freeze re-check through "CS2 killed, detection
@@ -230,6 +336,7 @@ pub(super) async fn run_scenario_inner(
     let mut tail = open_log_tail(
         &session.console_log_path,
         &session.sigs,
+        ctx.config.project.settings.benchmark_kind,
         ctx.config.mock_cs2_log,
     )
     .await?;
@@ -238,7 +345,7 @@ pub(super) async fn run_scenario_inner(
     let watchdog = Duration::from_secs(ctx.config.project.settings.watchdog_seconds as u64);
 
     // Confirmed live: the Win32 "window is visible" signal alone (already
-    // waited for inside `reissue_map` itself) fires several seconds before
+    // waited for inside `send_console_command` itself) fires several seconds before
     // CS2 is actually processing keyboard input — the game still shows its
     // own boot/intro sequence after the window appears. Wait for a real,
     // log-observed readiness signal before ever sending simulated input,
@@ -246,11 +353,7 @@ pub(super) async fn run_scenario_inner(
     // doc comment). Reuses this scenario's own `watchdog` duration as the
     // search budget — real runs get a generous, user-configured timeout for
     // free; tests using a short `watchdog_seconds` stay fast automatically.
-    abortable(ctx.abort.clone(), async {
-        wait_for_menu_ready(&mut *tail, watchdog, events).await;
-        Ok(())
-    })
-    .await?;
+    wait_for_menu_ready(&mut *tail, watchdog, events).await;
 
     // Applied here, not right after process discovery above: the process
     // existing is not the same as CS2 having actually finished loading, and
@@ -258,7 +361,7 @@ pub(super) async fn run_scenario_inner(
     // signal this codebase already has -- affinity has no journal/rollback
     // dependency (process-scoped, dies with CS2), so there's no correctness
     // reason to apply it any earlier than immediately before the first
-    // `reissue_map` call that follows.
+    // `send_console_command` call that follows.
     if let Some(p) = affinity_module {
         crate::mutation::affinity_cpu::apply_to_pid(p, cs2_pid, sys).await?;
     }
@@ -270,7 +373,6 @@ pub(super) async fn run_scenario_inner(
         console_log_path: &session.console_log_path,
         sigs: &session.sigs,
         mock_cs2_log: ctx.config.mock_cs2_log,
-        abort: ctx.abort.clone(),
         affinity: affinity_module,
         webview_root_pid: ctx.config.webview_root_pid,
         events,
@@ -355,7 +457,6 @@ struct IterationCtx<'a> {
     console_log_path: &'a Path,
     sigs: &'a Signatures,
     mock_cs2_log: Option<Duration>,
-    abort: tokio::sync::watch::Receiver<bool>,
     affinity: Option<&'a AffinityCpuPayload>,
     webview_root_pid: Option<u32>,
     events: &'a mpsc::Sender<EngineEvent>,
@@ -367,18 +468,26 @@ struct IterationCtx<'a> {
     scenario_id: &'a str,
 }
 
-/// Settle between the console closing and starting a capture. Domain
-/// knowledge from this benchmark map specifically (not a generic engine
-/// concern): after the loading screen ends and the console closes, there's
-/// a black-screen countdown (~5s to 0), then the benchmark itself starts —
-/// and its first few seconds have abnormal frame times (shader/asset
-/// warm-up, not representative of steady-state performance). Capturing
-/// through that window would pollute every iteration's metrics with a
-/// transient that has nothing to do with whatever's actually being
-/// benchmarked. Purely additive: this runs *before* `PmArgs.timed_seconds`
-/// starts counting, not carved out of it, so `capture_seconds` still means
-/// what the project config says it means.
-const SETTLE_BEFORE_CAPTURE: Duration = Duration::from_secs(8);
+/// Settle between the console closing and starting a capture, per benchmark
+/// kind. Each arm states the invariant it protects; the live tuning
+/// history behind the numbers is in the specs, not here.
+///
+/// * `WorkshopDust2`: 8s covers the map's own black-screen countdown plus
+///   shader warm-up after the map-loaded marker, so the first captured
+///   frames are gameplay, not a loading screen
+///   (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md D6).
+/// * `AveYoCfgV2`: [`AVEYO_SETTLE_SECONDS`] plus a capture of at most
+///   [`crate::model::settings::AVEYO_MAX_CAPTURE_SECONDS`] must end before `benchmark2.cfg`'s own
+///   disconnect ~58s in -- the settle and `Settings::validate`'s bound on
+///   `capture_seconds` share those two constants so the window can never
+///   slide past it (docs/superpowers/specs/2026-09-09-aveyo-benchmark-design.md
+///   D6, confirmed live and by screen capture).
+fn settle_before_capture(kind: BenchmarkKind) -> Duration {
+    match kind {
+        BenchmarkKind::WorkshopDust2 => Duration::from_secs(8),
+        BenchmarkKind::AveYoCfgV2 => Duration::from_secs(AVEYO_SETTLE_SECONDS),
+    }
+}
 
 /// One warmup (`capture: None`) or measure (`capture: Some`) iteration.
 /// Returns `Ok(Some(metrics))` for a measure iteration, `Ok(None)` for
@@ -406,10 +515,38 @@ async fn run_one_iteration(
 ) -> Result<Option<Metrics>> {
     // Honour Pause between iterations (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §7.1: "ControlMsg::Pause is
     // honoured only between iterations").
+    //
+    // Deliberately NOT also draining the live `shutdown_when_complete`
+    // toggle here (`control::drain_shutdown_toggle`, see the M3
+    // reboots-design doc and `RunConfig::shutdown_when_complete`'s own doc
+    // comment): this checkpoint sits at the bottom of a call chain shared by
+    // 10+ existing call sites (`measure_stage`/`run_scenario`/
+    // `run_scenario_inner`/`IterationCtx`, and every test in
+    // `run/execute/tests/{scenario,launch_args,preflight}.rs` that drives
+    // one of them directly) -- threading `&mut RunProgress`/the run
+    // directory this deep would touch all of them for a toggle that only
+    // needs "between iterations/between scenarios" granularity, which the
+    // two `maybe_break`/`wait_for_thermal_cooldown` checkpoints in
+    // `execute/mod.rs` already provide. Skipping this one only widens the
+    // toggle's worst-case staleness window to "at most one scenario's own
+    // iteration count" (it's still observed at the very next inter-scenario
+    // break), which is acceptable for a preference toggle with no
+    // sub-second responsiveness requirement.
     honor_pause(control).await?;
 
-    let map_cmd = format!("map_workshop {} de_dust2", ctx.settings.map_id);
-    ctx.sys.reissue_map(&map_cmd).await?;
+    let map_cmd = match ctx.settings.benchmark_kind {
+        BenchmarkKind::WorkshopDust2 => {
+            format!("map_workshop {} de_dust2", ctx.settings.map_id)
+        }
+        // Confirmed directly: AveYo's aliases (`bb`/`bx`) are only defined
+        // once benchmark.cfg itself has been loaded, so the trigger issues
+        // the underlying alias body directly rather than relying on `BB`
+        // being predefined. Always the single-run variant -- VOIDFRAME's
+        // own warmup_loops/measure_loops drives repeats, never AveYo's
+        // internal BX 10x loop (spec D3).
+        BenchmarkKind::AveYoCfgV2 => "alias set v2;sv_cheats 1;exec_async benchmark".to_string(),
+    };
+    ctx.sys.send_console_command(&map_cmd).await?;
     ctx.events
         .send(EngineEvent::LogLine {
             text: "Waiting for map load".into(),
@@ -417,15 +554,11 @@ async fn run_one_iteration(
         .await
         .ok();
 
-    let mut ready = abortable(
-        ctx.abort.clone(),
-        tail.wait_for(ctx.watchdog, &mut is_ready_marker),
-    )
-    .await?;
+    let mut ready = tail.wait_for(ctx.watchdog, &mut is_ready_marker).await?;
     if ready.is_none() {
         // Diagnostics: distinguishes "nothing was ever read from
         // console.log during this wait" (a truncation/identity-detection
-        // bug, or reissue_map's input never actually reaching CS2) from
+        // bug, or send_console_command's input never actually reaching CS2) from
         // "plenty was read, just never the map-load marker" (a regex
         // problem, or CS2 genuinely failing to load the map) — without
         // needing to reproduce a live failure to find out which.
@@ -445,24 +578,22 @@ async fn run_one_iteration(
         let relaunched =
             wait_for_process(ctx.sys, "cs2.exe", Duration::from_secs(60), true).await?;
         *cs2_pid = relaunched.pid;
-        *tail = open_log_tail(ctx.console_log_path, ctx.sigs, ctx.mock_cs2_log).await?;
-        abortable(ctx.abort.clone(), async {
-            wait_for_menu_ready(&mut **tail, ctx.watchdog, ctx.events).await;
-            Ok(())
-        })
+        *tail = open_log_tail(
+            ctx.console_log_path,
+            ctx.sigs,
+            ctx.settings.benchmark_kind,
+            ctx.mock_cs2_log,
+        )
         .await?;
+        wait_for_menu_ready(&mut **tail, ctx.watchdog, ctx.events).await;
         // Same reasoning as the initial-launch path: applied after the game
         // is actually loaded and responsive, not right after the relaunched
         // process is discovered.
         if let Some(affinity) = ctx.affinity {
             crate::mutation::affinity_cpu::apply_to_pid(affinity, *cs2_pid, ctx.sys).await?;
         }
-        ctx.sys.reissue_map(&map_cmd).await?;
-        ready = abortable(
-            ctx.abort.clone(),
-            tail.wait_for(ctx.watchdog, &mut is_ready_marker),
-        )
-        .await?;
+        ctx.sys.send_console_command(&map_cmd).await?;
+        ready = tail.wait_for(ctx.watchdog, &mut is_ready_marker).await?;
         if ready.is_none() {
             // docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §10: a second watchdog failure -> RunFailed -> full
             // ROLLBACK. Returning Err here, propagated up through
@@ -481,17 +612,18 @@ async fn run_one_iteration(
     // `ready` is `Some` here — either from the initial wait, or the
     // relaunch retry above (any other path already returned `Err`). Close
     // the console now, via the real signal that the load actually
-    // finished, rather than on a fixed delay guessed inside `reissue_map`
+    // finished, rather than on a fixed delay guessed inside `send_console_command`
     // itself — a real cold map load's duration isn't knowable up front,
     // and guessing it short was confirmed live to leave the console open.
     ctx.sys.hide_console().await?;
 
-    // `suspended` tracks whether the block below actually needs undoing —
-    // not currently reachable in this plan (`webview_root_pid` is always
-    // `None` everywhere in M1), but new code, and worth getting right now
-    // rather than shipping a known latent bug for
-    // `docs/superpowers/plans/2026-09-01-m1-phase-4a-tauri-backend-bridge.md`
-    // (the first real `Some(webview_root_pid)` caller) to discover later.
+    // `suspended` tracks whether the block below actually needs undoing.
+    // (This was written when `webview_root_pid` was always `None`; it is
+    // live now -- `src-tauri/src/commands/run.rs` passes
+    // `Some(current_process_id())` on both of its run-preparation paths, so
+    // every real desktop run suspends here. The abort path has its own
+    // resume, in `finalize_aborted_run`, since a dropped body never reaches
+    // the one below.)
     let suspended = capture.is_some() && ctx.webview_root_pid.is_some();
     if capture.is_some() {
         ctx.events.send(EngineEvent::CapturePending).await.ok();
@@ -510,11 +642,7 @@ async fn run_one_iteration(
     // cleanup already uses for CS2.
     let body_result: Result<Option<Metrics>> = async {
         let metrics = if let Some(c) = capture {
-            abortable(ctx.abort.clone(), async {
-                tokio::time::sleep(SETTLE_BEFORE_CAPTURE).await;
-                Ok(())
-            })
-            .await?;
+            tokio::time::sleep(settle_before_capture(ctx.settings.benchmark_kind)).await;
             let output_file =
                 capture_csv_path(ctx.data_root, ctx.run_id, ctx.scenario_id, iteration_index);
             // PresentMon does not create missing directories for its own
@@ -533,7 +661,7 @@ async fn run_one_iteration(
             // `Command` (see its own doc comment) makes an abort here
             // actually terminate the real PresentMon process rather than
             // leaving it running detached.
-            let capture_result = abortable(ctx.abort.clone(), c.capture(&args)).await;
+            let capture_result = c.capture(&args).await;
             // Sent regardless of outcome — a listener bracketing the real
             // capture window (e.g. an audio cue) cares that recording
             // ended, whether or not it ended successfully. `?` below still
@@ -544,13 +672,11 @@ async fn run_one_iteration(
             None
         };
 
-        let _ = abortable(
-            ctx.abort.clone(),
-            tail.wait_for(ctx.watchdog, &mut |ev| {
+        let _ = tail
+            .wait_for(ctx.watchdog, &mut |ev| {
                 matches!(ev, DetectionEvent::BenchmarkEnded)
-            }),
-        )
-        .await?;
+            })
+            .await?;
 
         Ok(metrics)
     }

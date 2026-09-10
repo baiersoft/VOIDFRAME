@@ -7,6 +7,7 @@
 pub mod catalog;
 pub mod config;
 pub mod module;
+pub mod progress;
 pub mod project;
 pub mod results;
 pub mod settings;
@@ -66,5 +67,5 @@ pub use module::{
 };
 pub use project::{Baseline, Project, Scenario, seed_alpha_test_project};
 pub use results::{MetricDelta, Metrics, RunResults, ScenarioResult, Verdict};
-pub use settings::Settings;
+pub use settings::{BenchmarkKind, Settings};
 pub use thermal::ThermalLog;

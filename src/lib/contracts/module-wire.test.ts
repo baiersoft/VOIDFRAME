@@ -17,13 +17,24 @@ const _exhaustive: Record<Module["type"], true> = {
   power_plan: true,
   affinity_cpu: true,
   launch_args: true,
+  custom_script: true,
+  cs2_config: true,
   unsupported: true,
 };
 
 describe("Module wire contract", () => {
   it("covers every variant the engine can emit", () => {
     const types = modules.map((m) => m.type);
-    expect(types).toEqual(["registry", "powercfg", "power_plan", "affinity_cpu", "launch_args", "unsupported"]);
+    expect(types).toEqual([
+      "registry",
+      "powercfg",
+      "power_plan",
+      "affinity_cpu",
+      "launch_args",
+      "custom_script",
+      "cs2_config",
+      "unsupported",
+    ]);
   });
 
   it("narrows by the `type` discriminant without casts", () => {

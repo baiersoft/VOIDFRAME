@@ -13,8 +13,8 @@ use super::steam::{
 };
 use crate::cs2::detection::{Cs2LogDetector, DetectionEvent, Signatures};
 use crate::error::{Error, Result};
-use crate::model::Module;
 use crate::model::project::Scenario;
+use crate::model::{BenchmarkKind, Module};
 use crate::run::{ControlMsg, EngineEvent};
 use crate::system::{Cs2LaunchSpec, SystemController};
 use std::path::{Path, PathBuf};
@@ -253,6 +253,12 @@ pub(super) async fn prepare_cs2_session(
         (game_dir.join("console.log"), game_dir.join("cfg"))
     };
     crate::cs2::keybind_cfg::ensure_written(&cs2_cfg_dir)?;
+    // Exhaustive on purpose: a third kind has to say which cfg files it
+    // needs rather than silently getting none.
+    match ctx.config.project.settings.benchmark_kind {
+        BenchmarkKind::WorkshopDust2 => {}
+        BenchmarkKind::AveYoCfgV2 => crate::cs2::aveyo_cfg::ensure_written(&cs2_cfg_dir)?,
+    }
 
     // --- Load detection signatures (docs/superpowers/specs/2026-09-01-m1-benchmark-engine-design.md §7.4) ---
     // Resolved and loaded here — before the stale-CS2-process check and
@@ -361,7 +367,7 @@ pub(super) fn is_ready_marker(ev: &DetectionEvent) -> bool {
     // combined wait, not two sequential ones — see this task's report for
     // the full reasoning (spike/findings.md §2 shows `[Server] BeginMatch`
     // following `Loading map` by only a few hundred ms in the one captured
-    // run, and repeated `reissue_map` calls against the same already-
+    // run, and repeated `send_console_command` calls against the same already-
     // running CS2 process are not confirmed to always re-emit a fresh
     // `BeginMatch` line the same way they reliably re-emit `Loading map`).
     // Accepting either, whichever the log actually produces first, is the
@@ -375,7 +381,7 @@ pub(super) fn is_ready_marker(ev: &DetectionEvent) -> bool {
 /// Waits for CS2's own main-menu-load completion signal (see
 /// `Signatures::menu_ready`'s doc comment) before the caller sends any
 /// simulated input. Confirmed live: the Win32 "window is visible" signal
-/// alone (already waited for inside `reissue_map` itself, via
+/// alone (already waited for inside `send_console_command` itself, via
 /// `find_visible_window_for_pid`) fires several seconds before the game is
 /// actually processing keyboard input — CS2 still shows its own boot/intro
 /// sequence after the window appears, and pressing the console-open key
@@ -391,7 +397,7 @@ pub(super) fn is_ready_marker(ev: &DetectionEvent) -> bool {
 /// iteration would be (that failure mode is already handled by the
 /// watchdog). Called once per CS2 launch — right after each `LogTail::open`
 /// (the initial one and the watchdog's relaunch one), before the first
-/// `reissue_map` call that follows it — never once per iteration, since
+/// `send_console_command` call that follows it — never once per iteration, since
 /// CS2's own menu-boot sequence only happens once per process lifetime.
 ///
 /// `timeout` is the caller's own scenario `watchdog` duration, reused
@@ -443,7 +449,7 @@ pub(super) async fn wait_for_menu_ready(
         }
         Err(e) => {
             // A real I/O error reading console.log here doesn't need to
-            // escalate on its own — the caller's subsequent reissue_map/
+            // escalate on its own — the caller's subsequent send_console_command/
             // wait_for calls will surface a real error if console.log is
             // genuinely broken.
             tracing::warn!(

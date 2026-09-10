@@ -10,6 +10,19 @@ import { execFileSync } from "node:child_process";
 // Passed to the app via VOIDFRAME_DATA_ROOT (state.rs's AppState::new()).
 const DATA_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "voidframe-e2e-"));
 
+// Sandboxes VOIDFRAME_RESTORE.bat's Desktop mirror too -- `restore_script.rs`'s
+// `targets()` writes it via `dirs::desktop_dir()` (the REAL Windows Desktop),
+// completely independent of VOIDFRAME_DATA_ROOT, unless VOIDFRAME_DESKTOP_ROOT
+// is set (restore_script.rs's own `desktop_dir()`). Confirmed live
+// (2026-09-08): without this, 08-shutdown-and-reboot-mock.e2e.ts's
+// `reboot_pending` test -- which reaches SNAPSHOT (writing the Desktop copy)
+// against the mock backend's HAGS scenario, then deliberately never finishes
+// the run -- leaves a real, wrong "delete HwSchMode" script on the
+// developer's real Desktop with no cleanup. A subdirectory of DATA_ROOT, not
+// its own tempdir, so it's cleaned up by the same `onComplete` below.
+const DESKTOP_ROOT = path.join(DATA_ROOT, "desktop");
+fs.mkdirSync(DESKTOP_ROOT, { recursive: true });
+
 // Seeds the fresh data root with a real, current-schema project + its real
 // run results (`fixtures/wcps-v3-study/`, copied from an actual PresentMon
 // capture study, reprocessed under the current WCPS v3 scoring pipeline
@@ -19,6 +32,17 @@ const DATA_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "voidframe-e2e-"));
 // this is the whole seed. Lets 05-results-visualizer.e2e.ts exercise the
 // real Visualizer & Charts view against rich, real data without ever
 // running (or waiting out) a real benchmark.
+//
+// Also derives a second, older run for the same project (same
+// `project_id`, an earlier `completed_at`, trimmed to just the baseline +
+// one non-winning scenario) rather than hand-maintaining a second large
+// fixture file -- `list_results_impl` only cares that `results.json` exists
+// under `runs/<any-dir>/` and its own `project_id` matches, so this is a
+// real second run as far as the app can tell. Lets
+// 05-results-visualizer.e2e.ts exercise the run-switcher dropdown
+// (ResultsVisualizer's `runHistory` prop) against two genuinely different
+// runs without a second real benchmark.
+const OLDER_RUN_ID = "8f000000-0000-4000-8000-000000000001";
 function seedFixtures(dataRoot: string): void {
   const fixtureDir = path.join(__dirname, "fixtures", "wcps-v3-study");
   const project = JSON.parse(fs.readFileSync(path.join(fixtureDir, "project.json"), "utf8"));
@@ -34,6 +58,16 @@ function seedFixtures(dataRoot: string): void {
   const runDir = path.join(dataRoot, "runs", results.run_id);
   fs.mkdirSync(runDir, { recursive: true });
   fs.copyFileSync(path.join(fixtureDir, "results.json"), path.join(runDir, "results.json"));
+
+  const olderResults = {
+    ...results,
+    run_id: OLDER_RUN_ID,
+    completed_at: "2026-09-01T10:00:00Z",
+    scenarios: [results.scenarios[0]],
+  };
+  const olderRunDir = path.join(dataRoot, "runs", OLDER_RUN_ID);
+  fs.mkdirSync(olderRunDir, { recursive: true });
+  fs.writeFileSync(path.join(olderRunDir, "results.json"), JSON.stringify(olderResults));
 }
 seedFixtures(DATA_ROOT);
 
@@ -74,6 +108,8 @@ export const config: WebdriverIO.Config = {
     "./specs/05-*.e2e.ts",
     "./specs/06-*.e2e.ts",
     "./specs/07-*.e2e.ts",
+    "./specs/08-*.e2e.ts",
+    "./specs/09-*.e2e.ts",
   ],
   suites: {
     safe: [
@@ -83,6 +119,8 @@ export const config: WebdriverIO.Config = {
       "./specs/05-*.e2e.ts",
       "./specs/06-*.e2e.ts",
       "./specs/07-*.e2e.ts",
+      "./specs/08-*.e2e.ts",
+      "./specs/09-*.e2e.ts",
     ],
     full: ["./specs/**/*.e2e.ts"],
   },
@@ -116,7 +154,16 @@ export const config: WebdriverIO.Config = {
         // run/execute/scenario.rs -- that's deliberately left alone rather
         // than special-cased for testing, so keep the test project's own
         // scenario/loop counts low).
-        env: { VOIDFRAME_DATA_ROOT: DATA_ROOT, VOIDFRAME_SIMULATE_RUN: "1" },
+        env: {
+          VOIDFRAME_DATA_ROOT: DATA_ROOT,
+          VOIDFRAME_DESKTOP_ROOT: DESKTOP_ROOT,
+          VOIDFRAME_SIMULATE_RUN: "1",
+          // Pins the mock thermal baseline to ~10s (40 samples x 250ms) so
+          // 07-abort-mock-run can click Abort/the shutdown checkbox DURING
+          // the baseline -- the exact window where the 2026-09-07 instant-
+          // abort refactor's bug class lived (see that spec).
+          VOIDFRAME_MOCK_THERMAL: "250,40",
+        },
       },
     } as WebdriverIO.Capabilities,
   ],

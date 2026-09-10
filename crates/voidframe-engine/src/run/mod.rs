@@ -6,11 +6,14 @@ pub mod execute;
 pub mod phase;
 mod run_log;
 pub mod spawn;
+pub mod transition;
 
 use crate::model::results::{Metrics, ScenarioResult};
+pub use execute::{RunConfig, RunOutcome, RunStart};
 pub use phase::{DetectionTier, IterationKind, Phase};
 use serde::Serialize;
 pub use spawn::{RunHandle, spawn_run};
+pub use transition::{Transition, count_reboots, plan_transition};
 
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
@@ -26,6 +29,14 @@ pub enum EngineEvent {
         kind: IterationKind,
         index: u32,
     },
+    /// One HWiNFO reading taken during the pre-run thermal baseline or a
+    /// cooldown check — drives the UI's live countdown.
+    ThermalProgress {
+        sample: u32,
+        total: u32,
+        cpu_temp_celsius: f64,
+        gpu_temp_celsius: Option<f64>,
+    },
     CapturePending,
     CaptureResumed,
     /// Bracket ONLY the real PresentMon capture call itself (not the settle
@@ -40,6 +51,20 @@ pub enum EngineEvent {
         metrics: Metrics,
     },
     ScenarioComplete {
+        result: ScenarioResult,
+    },
+    /// Emitted once per non-baseline scenario from `finish_run`, immediately
+    /// after `score_scenarios()` computes its real `wcps`/`verdict` --
+    /// unlike `ScenarioComplete` (fired right when the scenario's own
+    /// measure stage finishes, before the whole run's baseline comparison
+    /// is available), this always carries the final, real score. Exists
+    /// because `run.log`'s own `ScenarioComplete` line was otherwise always
+    /// wrong (see `run_log.rs`'s `format_event`) -- it printed the
+    /// not-yet-scored placeholder (`wcps=0.00 verdict=confirmed_same`) for
+    /// every scenario in every run, contradicting the real `results.json`.
+    /// Confirmed on real alpha-tester data:
+    /// study/pamuk/ab-test-analysis-report.md §3.
+    ScenarioScored {
         result: ScenarioResult,
     },
     OperatorPrompt {

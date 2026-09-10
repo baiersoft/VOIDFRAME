@@ -123,4 +123,98 @@ describe("RunCountdownModal", () => {
       vi.useRealTimers();
     }
   });
+
+  it("toggling the shutdown checkbox neither restarts the tick nor loses the toggled value", async () => {
+    vi.useFakeTimers();
+    try {
+      const onConfirm = vi.fn();
+      render(
+        <RunCountdownModal
+          project={PROJECT}
+          onCancel={vi.fn()}
+          onConfirm={onConfirm}
+          countdownSeconds={2}
+          shutdownDefault={false}
+        />
+      );
+      // 900ms into the first tick, toggle the checkbox: the pending 1s
+      // timeout must keep running, not be torn down and re-armed.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(900);
+      });
+      fireEvent.click(screen.getByRole("checkbox"));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(screen.getByText("1")).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+      expect(onConfirm).toHaveBeenCalledWith({ shutdownWhenComplete: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the reboot count and a summary line covering the pre-flight AutoLogon check", () => {
+    render(
+      <RunCountdownModal
+        project={PROJECT}
+        onCancel={vi.fn()}
+        onConfirm={vi.fn()}
+        countdownSeconds={30}
+        rebootCount={2}
+        shutdownDefault={false}
+      />
+    );
+    expect(screen.getByText(/2 reboot/i)).toBeInTheDocument();
+    expect(screen.getByText(/autologon checked at pre-flight/i)).toBeInTheDocument();
+  });
+
+  it("defaults the shutdown checkbox from shutdownDefault", () => {
+    render(
+      <RunCountdownModal
+        project={PROJECT}
+        onCancel={vi.fn()}
+        onConfirm={vi.fn()}
+        countdownSeconds={30}
+        rebootCount={0}
+        shutdownDefault={true}
+      />
+    );
+    const checkbox = screen.getByRole("checkbox", { name: /shut down when the run completes/i });
+    expect(checkbox).toBeChecked();
+  });
+
+  it("passes the toggled shutdown-when-complete choice to onConfirm once the countdown reaches zero", async () => {
+    vi.useFakeTimers();
+    try {
+      const onConfirm = vi.fn();
+      render(
+        <RunCountdownModal
+          project={PROJECT}
+          onCancel={vi.fn()}
+          onConfirm={onConfirm}
+          countdownSeconds={2}
+          rebootCount={0}
+          shutdownDefault={false}
+        />
+      );
+      const checkbox = screen.getByRole("checkbox", { name: /shut down when the run completes/i });
+      expect(checkbox).not.toBeChecked();
+      fireEvent.click(checkbox);
+      expect(checkbox).toBeChecked();
+
+      for (let i = 0; i < 2; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+      }
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+      expect(onConfirm).toHaveBeenCalledWith({ shutdownWhenComplete: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

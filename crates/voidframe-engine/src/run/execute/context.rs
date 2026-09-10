@@ -33,4 +33,17 @@ pub(super) struct RunContext<'a> {
     /// own handle and races it via `tokio::select!` rather than needing
     /// exclusive `&mut` access to one shared receiver.
     pub abort: tokio::sync::watch::Receiver<bool>,
+    /// The "point of no return" shield the top-level abort race
+    /// (`control::wait_for_abort_allowed`) consults before it is allowed to
+    /// drop the run body. Set permanently by `reboot_sequence`/`finish_run`/
+    /// `handle_body_failure` (a reboot or the final cleanup is underway --
+    /// dropping the body there would strand half-done work), and flipped on
+    /// and off again briefly (via `no_return::NoReturnGuard`) by
+    /// `mutation::power_plan`'s create branch around its one
+    /// journal-after-apply `.await` and by `scenario::revert_stage` around
+    /// its journal replay. A `Sender` (not a
+    /// `Receiver`): everything holding a `RunContext` is a *producer* of
+    /// shielded windows; the single consumer is the abort arm in
+    /// `execute()`.
+    pub no_return: tokio::sync::watch::Sender<bool>,
 }

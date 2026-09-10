@@ -1,4 +1,4 @@
-//! `start_run` / `send_control` — the real Tauri bridge into
+//! `start_run` / `resume_run` / `send_control` — the real Tauri bridge into
 //! `voidframe_engine::run::execute`. This is the UI-facing analog of
 //! `voidframe-cli`'s `cmd_run.rs`: same spawn/forward/control-channel
 //! wiring, except events go to the frontend via `app.emit("vf:event", ..)`
@@ -6,15 +6,29 @@
 //! like every other event rather than auto-acknowledged — a real UI modal
 //! (`LiveMonitor`, from the frontend-integration plans) answers it by calling
 //! `send_control(ControlMsg::OperatorAcknowledged)`.
+//!
+//! `spawn_and_forward` is the one place both `start_run` (a fresh run) and
+//! `resume_run` (spec §3.4, picking a `RebootPending` run back up after
+//! `--resume`) hand off to the engine and forward its event stream — both
+//! also start the heartbeat task here (spec §5.2). The one outcome the two
+//! paths handle differently from every other exit is
+//! `RunOutcome::RebootPending`: the OS reboot is about to kill this process,
+//! so `active_run` and the crash-recovery store are deliberately left
+//! exactly as they are (a later `--resume` reads them back) — see
+//! `spawn_and_forward`'s own doc comment for how that's structured.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{Emitter, Manager};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use voidframe_engine::capture::runner::{CaptureRunner, RealCaptureRunner};
+use voidframe_engine::model::progress::RunProgress;
 use voidframe_engine::model::project::Project;
 use voidframe_engine::run::execute::RunConfig;
-use voidframe_engine::run::{ControlMsg, EngineEvent, Phase};
+use voidframe_engine::run::{ControlMsg, EngineEvent, Phase, RunOutcome, RunStart};
+use voidframe_engine::store::StoreHandle;
+use voidframe_engine::system::SystemController;
 
 use crate::state::ActiveRun;
 
@@ -25,10 +39,26 @@ use crate::state::ActiveRun;
 /// `commands::run_store`'s own `phase_changed_patches_current_scenario_not_just_phase`
 /// uses) without needing the rest of `start_run`'s `AppHandle`/`State`
 /// plumbing.
-async fn refuse_if_unresolved_run_state(
-    store: &voidframe_engine::store::StoreHandle,
-) -> Result<(), String> {
+async fn refuse_if_unresolved_run_state(store: &StoreHandle) -> Result<(), String> {
     match store.snapshot().await.map_err(|e| e.to_string())? {
+        // A `RebootPending` snapshot isn't a crash -- it's a run
+        // deliberately waiting for `resume_run` to pick it back up after the
+        // OS reboots this process away (spec §3.3/§3.5); `BootResume` is
+        // that same run interrupted again during its post-boot settle, which
+        // `resume_run` also accepts. Emergency Restore remains the way out
+        // for someone who wants to abandon it instead.
+        Some(snapshot)
+            if matches!(
+                snapshot.phase,
+                Phase::RebootPending { .. } | Phase::BootResume
+            ) =>
+        {
+            Err(
+                "a run is waiting to resume after a reboot -- use Resume on the dashboard, or \
+                 Emergency Restore to abandon it"
+                    .to_string(),
+            )
+        }
         Some(_) => Err(
             "a previous run's crash-recovery state is still unresolved -- use Emergency \
              Restore to roll it back before starting a new run"
@@ -104,32 +134,71 @@ impl std::fmt::Debug for PreparedRun {
 }
 
 /// The fallible preparation chain between reserving `active_run` and
-/// spawning the engine task: loads the project, reads `config.json`,
-/// re-validates the PresentMon/HWiNFO paths, and builds the `RunConfig` and
+/// spawning the engine task: resolves the project (from disk, or from
+/// `project_override` -- see below), reads `config.json`, re-validates the
+/// PresentMon/HWiNFO paths, and builds the `RunConfig` and
 /// `SystemController`/`CaptureRunner` the run will actually use. Split out
 /// of `start_run_after_reservation` so the ordering (project load fails
 /// before `state.sys` is ever touched) is exercised directly by
 /// `a_failed_preparation_releases_the_reservation` without needing a real
 /// project on disk.
+///
+/// `project_override`: `resume_run` passes `Some(progress.project.clone())`
+/// so the resumed run replays against the exact project snapshot taken at
+/// its own start (spec §3.1) rather than whatever `<project_id>.json`
+/// happens to contain on disk now -- a project edited mid-run must not
+/// change what a resumed run applies/measures. `start_run` always passes
+/// `None`, the normal "load the current project" path.
 async fn prepare_run(
     state: &crate::state::AppState,
     project_id: &str,
     run_id: &str,
     dry_run: bool,
+    project_override: Option<Project>,
+    shutdown_when_complete: bool,
 ) -> Result<PreparedRun, String> {
-    // `Project::load`'s own `Display` is a bare io/serde message (e.g. on
-    // Windows, a missing file surfaces only as "io: The system cannot find
-    // the file specified.") with no path or project id in it -- `project_id`
-    // is prefixed here so the operator (and
-    // `a_failed_preparation_releases_the_reservation`, which asserts on this
-    // exact text) can tell which project failed to load.
-    let project = Project::load(
-        &state
-            .data_root
-            .projects_dir()
-            .join(format!("{project_id}.json")),
-    )
-    .map_err(|e| format!("{project_id}: {e}"))?;
+    let project = match project_override {
+        // The override comes straight out of `progress.json`
+        // (`%LOCALAPPDATA%`, writable by the unelevated user) and is never
+        // passed through `Project::load`, so it gets the same two checks
+        // `Project::load` gives a project read from disk: `id` is joined
+        // into `projects\<id>\scripts\` and every `custom_script` there is
+        // executed by this elevated process, and every scenario id is joined
+        // into a journal path. Without this a crafted `progress.json` could
+        // steer `--resume` into running an arbitrary script as
+        // Administrator.
+        Some(project) => {
+            crate::commands::projects::validate_project_id(&project.id)?;
+            project
+                .validate_structure()
+                .map_err(|e| format!("{}: {e}", project.id))?;
+            project
+        }
+        // `Project::load`'s own `Display` is a bare io/serde message (e.g.
+        // on Windows, a missing file surfaces only as "io: The system
+        // cannot find the file specified.") with no path or project id in
+        // it -- `project_id` is prefixed here so the operator (and
+        // `a_failed_preparation_releases_the_reservation`, which asserts on
+        // this exact text) can tell which project failed to load.
+        None => Project::load(
+            &state
+                .data_root
+                .projects_dir()
+                .join(format!("{project_id}.json")),
+        )
+        .map_err(|e| format!("{project_id}: {e}"))?,
+    };
+
+    // Best-effort, tolerant of a poisoned config mutex (falls back to the
+    // spec default rather than failing the whole run over a field that only
+    // matters once this run reaches a reboot) -- unlike
+    // `presentmon_path`/`hwinfo_path` below, a stale/default settle time is
+    // never a safety issue, just a possibly-too-short or too-long wait.
+    let post_boot_settle_seconds = state
+        .config
+        .lock()
+        .map(|cfg| cfg.post_boot_settle_seconds)
+        .unwrap_or(180);
 
     // Debug-build-only (the `mock-run` Cargo feature is never enabled by a
     // plain `cargo build`/`tauri build`/`tauri:build` release) AND only
@@ -142,8 +211,9 @@ async fn prepare_run(
     // no real PresentMon capture, so `run::execute`'s real state machine
     // and event stream (PhaseChanged/IterationComplete/ScenarioComplete/...)
     // drive the real UI in roughly a minute instead of ~20 (each iteration
-    // still pays the real, capture-independent `SETTLE_BEFORE_CAPTURE`
-    // delay in `run/execute/scenario.rs` -- deliberately left untouched
+    // still pays the real, capture-independent per-kind
+    // `settle_before_capture` delay in `run/execute/scenario.rs` --
+    // deliberately left untouched
     // rather than special-cased for this, so real-run timing behavior
     // isn't forked for a test-only path). PresentMon/HWiNFO path
     // validation below is skipped entirely: nothing here ever spawns
@@ -183,10 +253,16 @@ async fn prepare_run(
         // fixed value, so baseline and every cooldown check land on the
         // same reading and "already cool" is a foregone conclusion --
         // no reason to pay the real ~30s per check finding that out.
-        let thermal_sample_override = if realistic {
-            None
-        } else {
-            Some((std::time::Duration::from_millis(5), 2))
+        // `VOIDFRAME_MOCK_THERMAL` (via `parse_mock_thermal`) provides an
+        // E2E seam to pin the thermal baseline to a clickable window.
+        let thermal_sample_override = match std::env::var("VOIDFRAME_MOCK_THERMAL")
+            .ok()
+            .as_deref()
+            .and_then(parse_mock_thermal)
+        {
+            Some(pinned) => Some(pinned),
+            None if realistic => None,
+            None => Some((std::time::Duration::from_millis(5), 2)),
         };
 
         let config = RunConfig {
@@ -211,6 +287,9 @@ async fn prepare_run(
             // events instead of silently skipping them, matching what a
             // real run configured for thermal cooldown would do.
             hwinfo_path: Some(std::path::PathBuf::from("mock-hwinfo.exe")),
+            shutdown_when_complete,
+            post_boot_settle: Duration::from_secs(post_boot_settle_seconds.into()),
+            exe_path: std::env::current_exe().map_err(|e| e.to_string())?,
         };
         return Ok(PreparedRun {
             sys,
@@ -300,6 +379,9 @@ async fn prepare_run(
         thermal_sample_override: None,
         inter_scenario_break_seconds: 0,
         hwinfo_path,
+        shutdown_when_complete,
+        post_boot_settle: Duration::from_secs(post_boot_settle_seconds.into()),
+        exe_path: std::env::current_exe().map_err(|e| e.to_string())?,
     };
 
     Ok(PreparedRun {
@@ -332,6 +414,7 @@ async fn start_run_after_reservation(
     project_id: &str,
     run_id: &str,
     dry_run: bool,
+    shutdown_when_complete: bool,
 ) -> Result<PreparedRun, String> {
     // A `RunState` already on disk means the previous session ended without
     // a clean terminal event -- store/mod.rs's own doc comment calls this
@@ -369,7 +452,15 @@ async fn start_run_after_reservation(
             .await
             .map_err(|e| e.to_string())?;
 
-        prepare_run(state, project_id, run_id, dry_run).await
+        prepare_run(
+            state,
+            project_id,
+            run_id,
+            dry_run,
+            None,
+            shutdown_when_complete,
+        )
+        .await
     }
     .await;
 
@@ -418,6 +509,186 @@ pub async fn send_control(
     send_control_impl(&state.active_run, msg).await
 }
 
+/// Sends `value` down the currently active run's live `shutdown_when_complete`
+/// toggle channel -- a separate, dedicated channel from `control_tx` (see
+/// `voidframe_engine::run::execute::control::drain_shutdown_toggle`'s own doc
+/// comment for why this is never routed through `ControlMsg`). Split out
+/// from the `#[tauri::command]` wrapper for the same reason as
+/// `send_control_impl`.
+///
+/// `watch::Sender::send` is synchronous and never blocks -- unlike
+/// `send_control_impl`'s `control_tx.send(msg).await`, there is no backpressure
+/// to hold the lock across, so the guard can be dropped and the send made in
+/// the same statement. It only errors when every receiver has been dropped
+/// (the run has ended), which is mapped to the same "run has already ended"
+/// message `send_control_impl` uses for its own analogous failure.
+pub(crate) async fn set_shutdown_when_complete_impl(
+    active_run: &AsyncMutex<Option<ActiveRun>>,
+    value: bool,
+) -> Result<(), String> {
+    let guard = active_run.lock().await;
+    match guard.as_ref() {
+        Some(active) => active
+            .shutdown_toggle_tx
+            .send(value)
+            .map_err(|_| "run has already ended".to_string()),
+        None => Err("no run is currently active".to_string()),
+    }
+}
+
+#[specta::specta]
+#[tauri::command]
+pub async fn set_shutdown_when_complete(
+    state: tauri::State<'_, crate::state::AppState>,
+    value: bool,
+) -> Result<(), String> {
+    set_shutdown_when_complete_impl(&state.active_run, value).await
+}
+
+/// Spawns the engine task, forwards its event stream to the frontend and the
+/// crash-recovery store, and runs the heartbeat task (spec §5.2) alongside
+/// it -- the one hand-off both `start_run` (fresh) and `resume_run` (after
+/// `--resume`) share.
+///
+/// The forwarder does its own work -- spawn the run, forward events, await
+/// its join handle -- and never touches `active_run` itself. If its OWN code
+/// panics (not `execute()`, which is already isolated by `spawn_run`'s own
+/// `JoinHandle`) before finishing, cleanup must not depend on it reaching a
+/// particular line of its own body: dropping a `JoinHandle` does NOT abort
+/// the still-running engine task, and a panic here would otherwise skip a
+/// same-task cleanup line entirely. So a second, decoupled task only awaits
+/// the forwarder's own `JoinHandle` -- which resolves on every path: engine
+/// panic (already handled inside the forwarder, which then finishes
+/// normally), forwarder panic (caught there as `Err(JoinError)`), or
+/// ordinary completion.
+///
+/// `RunOutcome::RebootPending` is the one exception to "clear `active_run`
+/// once the run stops": the process is about to be killed by the OS reboot,
+/// and both `active_run` and the crash-recovery store must be left exactly
+/// as they are for `resume_run` to read back after `--resume`. The forwarder
+/// signals "go ahead and clean up" to the second task via a `oneshot` it
+/// only sends on every OTHER outcome (including a genuine failure) --
+/// dropping the sender without sending, as the `RebootPending` arm does, is
+/// what tells the cleanup task to skip clearing `active_run` altogether.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct piece of state spawn_run/execute() genuinely need; \
+              bundling them into a struct here would just move the same eight fields one layer \
+              over for no clarity gain"
+)]
+fn spawn_and_forward(
+    app: tauri::AppHandle,
+    store: StoreHandle,
+    sys: Arc<dyn SystemController>,
+    capture: Arc<dyn CaptureRunner>,
+    start: RunStart,
+    control_rx: mpsc::Receiver<ControlMsg>,
+    shutdown_toggle_rx: watch::Receiver<bool>,
+    run_dir: PathBuf,
+) {
+    let heartbeat_dir = run_dir.clone();
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            // `touch_heartbeat` is a synchronous file write -- kept off the
+            // async runtime like every other blocking-fs call in
+            // `commands/*.rs`. Best-effort either way: a missed beat only
+            // shortens the deadman's grace, it never fails the run.
+            let dir = heartbeat_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                voidframe_engine::recover::touch_heartbeat(&dir)
+            })
+            .await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+
+    let app_for_events = app.clone();
+    let (cleanup_tx, cleanup_rx) = oneshot::channel::<()>();
+
+    let mut run =
+        voidframe_engine::run::spawn_run(sys, capture, start, control_rx, shutdown_toggle_rx);
+    let forwarder = tokio::spawn(async move {
+        while let Some(ev) = run.events.recv().await {
+            let _ = app_for_events.emit("vf:event", &ev);
+            // Best-effort: a store-update failure must never stop event
+            // forwarding to the UI -- the UI seeing the real event stream
+            // is what matters; `get_run_snapshot` losing one intermediate
+            // update is a much smaller problem than the live monitor
+            // silently freezing because a background actor hiccuped.
+            let _ = super::run_store::update_store_from_event(&store, &ev).await;
+        }
+
+        // `run.join.await` is `Result<Result<RunOutcome, engine::Error>,
+        // JoinError>` -- BOTH layers matter. `spawn_run` already turns every
+        // `Err` from `execute()` into exactly one `RunFailed`, sent through
+        // the same `run.events` channel forwarded above -- so the frontend
+        // and `update_store_from_event` (which clears the store on
+        // `RunFailed`) have already seen it by the time this `match` runs.
+        // Only a genuine panic (the outer `JoinError`) still needs its own
+        // `RunFailed`/`store.clear()` here, since `spawn_run` never gets the
+        // chance to emit one for a task that panicked instead of returning.
+        match run.join.await {
+            Ok(Ok(RunOutcome::RebootPending(reason))) => {
+                log::info!("engine leg ended with a pending reboot ({reason}); waiting for the OS");
+                // Deliberately does NOT send on `cleanup_tx`: `active_run`
+                // and the store must be left exactly as they are (see this
+                // function's own doc comment). A watchdog covers the case
+                // where `SystemController::reboot` silently never actually
+                // reboots the machine.
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    log::error!(
+                        "60s after entering RebootPending and the OS still has not rebooted \
+                         this process away -- the reboot may have failed silently"
+                    );
+                });
+            }
+            Ok(Ok(RunOutcome::ShutdownRequested(_))) => {
+                log::info!("run complete; shutdown requested");
+                let _ = cleanup_tx.send(());
+            }
+            Ok(Ok(RunOutcome::Complete(_))) => {
+                // `execute()` emits `RunComplete` itself on the success
+                // path, which `update_store_from_event` has already turned
+                // into a `store.clear()`. Nothing to do here besides
+                // cleaning up `active_run`.
+                let _ = cleanup_tx.send(());
+            }
+            Ok(Err(e)) => {
+                // RunFailed was already emitted by spawn_run and cleared the
+                // store via the forward loop above.
+                log::error!("engine run failed: {e}");
+                let _ = cleanup_tx.send(());
+            }
+            Err(join_err) => {
+                log::error!("engine task join error (likely a panic): {join_err:?}");
+                let _ = app_for_events.emit(
+                    "vf:event",
+                    &EngineEvent::RunFailed {
+                        reason: format!("engine task panicked: {join_err}"),
+                    },
+                );
+                let _ = store.clear().await;
+                let _ = cleanup_tx.send(());
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let _ = forwarder.await;
+        // The heartbeat only matters while the engine leg (or its own
+        // forwarding) is still alive -- ends here regardless of outcome; on
+        // `RebootPending` the process is about to die anyway.
+        heartbeat.abort();
+        if cleanup_rx.await.is_ok()
+            && let Some(app_state) = app.try_state::<crate::state::AppState>()
+        {
+            *app_state.active_run.lock().await = None;
+            record_last_known_build_id(&app_state).await;
+        }
+    });
+}
+
 #[specta::specta]
 #[tauri::command]
 pub async fn start_run(
@@ -425,6 +696,7 @@ pub async fn start_run(
     state: tauri::State<'_, crate::state::AppState>,
     project_id: String,
     dry_run: bool,
+    shutdown_when_complete: bool,
 ) -> Result<String, String> {
     // Validated first, before generating a run_id or touching active_run/
     // the store at all -- a rejected id fails fast without reserving
@@ -436,6 +708,11 @@ pub async fn start_run(
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(16);
+    // Seeded with this run's own starting value -- see
+    // `voidframe_engine::run::execute::control::drain_shutdown_toggle`'s own
+    // doc comment for why `watch` (always exactly the latest value, a
+    // `.send()` that never blocks) is the right primitive for this toggle.
+    let (shutdown_toggle_tx, shutdown_toggle_rx) = watch::channel::<bool>(shutdown_when_complete);
 
     // Atomic check-and-reserve: the lock is held continuously from the
     // emptiness check through the insert (no `.await` in between), closing
@@ -452,6 +729,7 @@ pub async fn start_run(
         *guard = Some(ActiveRun {
             run_id: run_id.clone(),
             control_tx,
+            shutdown_toggle_tx,
         });
     }
 
@@ -463,80 +741,178 @@ pub async fn start_run(
         sys,
         capture,
         config,
-    } = start_run_after_reservation(&state, &project_id, &run_id, dry_run).await?;
+    } = start_run_after_reservation(
+        &state,
+        &project_id,
+        &run_id,
+        dry_run,
+        shutdown_when_complete,
+    )
+    .await?;
 
-    let store = state.store.clone();
-    let app_for_events = app.clone();
-
-    // The forwarder does its own work -- spawn the run, forward events,
-    // await its join handle -- and never touches `active_run` itself. If
-    // its OWN code panics (not `execute()`, which is already isolated by
-    // `spawn_run`'s own `JoinHandle`) before finishing, cleanup must not
-    // depend on it reaching a particular line of its own body: dropping a
-    // `JoinHandle` does NOT abort the still-running engine task, and a
-    // panic here would otherwise skip a same-task cleanup line entirely.
-    let mut run = voidframe_engine::run::spawn_run(sys, capture, config, control_rx);
-    let forwarder = tokio::spawn(async move {
-        while let Some(ev) = run.events.recv().await {
-            let _ = app_for_events.emit("vf:event", &ev);
-            // Best-effort: a store-update failure must never stop event
-            // forwarding to the UI -- the UI seeing the real event stream
-            // is what matters; `get_run_snapshot` losing one intermediate
-            // update is a much smaller problem than the live monitor
-            // silently freezing because a background actor hiccuped.
-            let _ = super::run_store::update_store_from_event(&store, &ev).await;
-        }
-
-        // `run.join.await` is `Result<Result<RunResults, engine::Error>,
-        // JoinError>` -- BOTH layers matter. `spawn_run` already turns every
-        // `Err` from `execute()` into exactly one `RunFailed`, sent through
-        // the same `run.events` channel forwarded above -- so the frontend
-        // and `update_store_from_event` (which clears the store on
-        // `RunFailed`) have already seen it by the time this `match` runs.
-        // Only a genuine panic (the outer `JoinError`) still needs its own
-        // `RunFailed`/`store.clear()` here, since `spawn_run` never gets the
-        // chance to emit one for a task that panicked instead of returning.
-        match run.join.await {
-            Ok(Ok(_)) => {
-                // `execute()` emits `RunComplete` itself on the success
-                // path, which `update_store_from_event` has already turned
-                // into a `store.clear()`. Nothing to do.
-            }
-            Ok(Err(e)) => {
-                // RunFailed was already emitted by spawn_run and cleared the
-                // store via the forward loop above.
-                log::error!("engine run failed: {e}");
-            }
-            Err(join_err) => {
-                log::error!("engine task join error (likely a panic): {join_err:?}");
-                let _ = app_for_events.emit(
-                    "vf:event",
-                    &EngineEvent::RunFailed {
-                        reason: format!("engine task panicked: {join_err}"),
-                    },
-                );
-                let _ = store.clear().await;
-            }
-        }
-    });
-
-    // Decoupled from the forwarder's own body on purpose: this task only
-    // awaits the forwarder's `JoinHandle`, which resolves to `Ok(())` on
-    // normal completion OR `Err(JoinError)` if the forwarder itself
-    // panicked -- either way that's the signal cleanup needs. This
-    // guarantees `active_run` is cleared on every path: engine panic
-    // (already handled inside the forwarder, which then finishes
-    // normally), forwarder panic (caught here as `Err(JoinError)`), and
-    // ordinary completion.
-    tokio::spawn(async move {
-        let _ = forwarder.await;
-        if let Some(app_state) = app.try_state::<crate::state::AppState>() {
-            *app_state.active_run.lock().await = None;
-            record_last_known_build_id(&app_state).await;
-        }
-    });
+    let run_dir = state.data_root.run_dir(&run_id);
+    spawn_and_forward(
+        app,
+        state.store.clone(),
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        control_rx,
+        shutdown_toggle_rx,
+        run_dir,
+    );
 
     Ok(run_id)
+}
+
+/// Everything `resume_run` does that only needs `&AppState`: the store
+/// snapshot/phase check, `RunProgress::load`, the atomic `active_run`
+/// reservation, and `prepare_run` with the progress's own project as the
+/// override (spec §3.4: "the progress's project snapshot is used, not the
+/// file on disk"). Split out of `resume_run_impl` so it's unit-testable
+/// without a live `tauri::AppHandle` -- the production `AppHandle` is
+/// `Wry`-typed and cannot be constructed outside a real webview;
+/// `tauri::test::mock_builder` builds a *different*, `MockRuntime`-typed
+/// handle that a `Wry`-specific signature can't accept. Same reasoning as
+/// every other `_impl` helper in this file (`send_control_impl`,
+/// `start_run_after_reservation`, ...).
+async fn resume_run_reserved(
+    state: &crate::state::AppState,
+) -> Result<
+    (
+        PreparedRun,
+        RunProgress,
+        mpsc::Receiver<ControlMsg>,
+        watch::Receiver<bool>,
+        PathBuf,
+    ),
+    String,
+> {
+    let snapshot = state
+        .store
+        .snapshot()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no run to resume".to_string())?;
+    // `BootResume` too: `begin_resume` persists it (via `run_store`) the
+    // moment a resume starts, before its ~180s settle wait -- a machine that
+    // reboots again, or a process killed, inside that window leaves the
+    // store at `BootResume` with `progress.json` still carrying the pending
+    // reboot. Refusing that here made such a run unresumable for good
+    // (`RESUME_TASK` re-firing every logon into this same error, and
+    // `start_run` refusing as an unresolved crash). The engine decides what
+    // the second resume means: a still-pending reboot classifies as an
+    // extra reboot (spec §4), a cleared one fails cleanly through
+    // `handle_body_failure`'s ROLLBACK.
+    if !matches!(
+        snapshot.phase,
+        Phase::RebootPending { .. } | Phase::BootResume
+    ) {
+        return Err(format!(
+            "run {} is not waiting for a reboot (phase {})",
+            snapshot.run_id, snapshot.phase
+        ));
+    }
+    // `run_id` is disk-sourced (`state/current.json`, writable by the
+    // unelevated user) and gets joined into a filesystem path immediately
+    // below -- same treatment `rollback_now`/`emergency_rollback` already
+    // give it.
+    crate::commands::projects::validate_project_id(&snapshot.run_id)?;
+    let run_dir = state.data_root.run_dir(&snapshot.run_id);
+    let progress = {
+        let run_dir = run_dir.clone();
+        tokio::task::spawn_blocking(move || RunProgress::load(&run_dir))
+            .await
+            .map_err(|e| crate::commands::join_error_to_string("resume_run progress load", e))?
+            .map_err(|e| e.to_string())?
+    };
+
+    let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(16);
+    // Seeded with the resumed run's own on-disk value -- see `start_run`'s
+    // matching comment on why `watch` and why it's seeded rather than
+    // defaulted.
+    let (shutdown_toggle_tx, shutdown_toggle_rx) =
+        watch::channel::<bool>(progress.shutdown_when_complete);
+    {
+        let mut guard = state.active_run.lock().await;
+        if guard.is_some() {
+            return Err("a run is already active".into());
+        }
+        *guard = Some(ActiveRun {
+            run_id: snapshot.run_id.clone(),
+            control_tx,
+            shutdown_toggle_tx,
+        });
+    }
+
+    let prepared = prepare_run(
+        state,
+        &progress.project.id,
+        &snapshot.run_id,
+        false,
+        Some(progress.project.clone()),
+        progress.shutdown_when_complete,
+    )
+    .await;
+    match prepared {
+        Ok(p) => Ok((p, progress, control_rx, shutdown_toggle_rx, run_dir)),
+        Err(e) => {
+            *state.active_run.lock().await = None;
+            Err(e)
+        }
+    }
+}
+
+/// The real production body of `resume_run`, taking only an `AppHandle` (not
+/// a `tauri::State`) so it's callable both as the `#[tauri::command]` below
+/// and from `lib.rs`'s `setup` hook on `--resume` startup, before any
+/// command has ever been invoked.
+pub(crate) async fn resume_run_impl(app: &tauri::AppHandle) -> Result<String, String> {
+    let state = app.state::<crate::state::AppState>();
+    let (prepared, progress, control_rx, shutdown_toggle_rx, run_dir) =
+        resume_run_reserved(&state).await?;
+    let PreparedRun {
+        sys,
+        capture,
+        config,
+    } = prepared;
+    let run_id = config.run_id.clone();
+    spawn_and_forward(
+        app.clone(),
+        state.store.clone(),
+        sys,
+        capture,
+        RunStart::Resume { config, progress },
+        control_rx,
+        shutdown_toggle_rx,
+        run_dir,
+    );
+    Ok(run_id)
+}
+
+#[specta::specta]
+#[tauri::command]
+pub async fn resume_run(app: tauri::AppHandle) -> Result<String, String> {
+    resume_run_impl(&app).await
+}
+
+/// Split out from [`is_resume_launch`] so it's unit-testable on a plain
+/// `bool`, without a real `tauri::State` -- same convention as every other
+/// `_impl` helper in this file.
+pub(crate) fn is_resume_launch_impl(resume_launch: bool) -> Result<bool, String> {
+    Ok(resume_launch)
+}
+
+/// Whether this process was launched via `--resume` -- see
+/// [`crate::state::AppState::resume_launch`]'s own doc comment for why the
+/// frontend needs this exposed synchronously, separately from
+/// `resume_run_impl`'s own completion.
+#[specta::specta]
+#[tauri::command]
+pub async fn is_resume_launch(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<bool, String> {
+    is_resume_launch_impl(state.resume_launch)
 }
 
 /// Records the CS2 build id this run ran against into `Config
@@ -601,6 +977,23 @@ async fn record_last_known_build_id(state: &crate::state::AppState) {
     }
 }
 
+/// Parses `VOIDFRAME_MOCK_THERMAL` ("interval_ms,count") -- the E2E seam
+/// that pins the mock run's thermal baseline to a clickable window (the
+/// fast preset finishes in milliseconds; the realistic preset takes a real
+/// 30s). Read only inside the `mock-run` + `VOIDFRAME_SIMULATE_RUN` gate
+/// below; malformed input degrades to `None` (the preset default) rather
+/// than failing a run over a test-only variable.
+#[cfg(any(test, feature = "mock-run"))]
+fn parse_mock_thermal(spec: &str) -> Option<(std::time::Duration, u32)> {
+    let (ms, count) = spec.split_once(',')?;
+    let ms: u64 = ms.trim().parse().ok()?;
+    let count: u32 = count.trim().parse().ok()?;
+    if count == 0 {
+        return None;
+    }
+    Some((std::time::Duration::from_millis(ms), count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,9 +1002,11 @@ mod tests {
     #[tokio::test]
     async fn send_control_forwards_to_the_active_runs_channel() {
         let (tx, mut rx) = mpsc::channel(4);
+        let (shutdown_toggle_tx, _shutdown_toggle_rx) = watch::channel(false);
         let active = tokio::sync::Mutex::new(Some(crate::state::ActiveRun {
             run_id: "r1".into(),
             control_tx: tx,
+            shutdown_toggle_tx,
         }));
         send_control_impl(&active, voidframe_engine::run::ControlMsg::Pause)
             .await
@@ -620,6 +1015,36 @@ mod tests {
             rx.recv().await,
             Some(voidframe_engine::run::ControlMsg::Pause)
         ));
+    }
+
+    /// Mirrors `send_control_forwards_to_the_active_runs_channel` for the new
+    /// live-toggle channel -- proves `set_shutdown_when_complete_impl` sends
+    /// down `shutdown_toggle_tx`, not `control_tx`.
+    #[tokio::test]
+    async fn set_shutdown_when_complete_forwards_to_the_active_runs_toggle_channel() {
+        let (control_tx, _control_rx) = mpsc::channel(4);
+        let (shutdown_toggle_tx, shutdown_toggle_rx) = watch::channel(false);
+        let active = tokio::sync::Mutex::new(Some(crate::state::ActiveRun {
+            run_id: "r1".into(),
+            control_tx,
+            shutdown_toggle_tx,
+        }));
+        set_shutdown_when_complete_impl(&active, true)
+            .await
+            .unwrap();
+        assert!(*shutdown_toggle_rx.borrow());
+    }
+
+    /// Mirrors `send_control_with_no_active_run_is_an_error_not_a_silent_noop`.
+    #[tokio::test]
+    async fn set_shutdown_when_complete_with_no_active_run_is_an_error_not_a_silent_noop() {
+        let active: tokio::sync::Mutex<Option<crate::state::ActiveRun>> =
+            tokio::sync::Mutex::new(None);
+        assert!(
+            set_shutdown_when_complete_impl(&active, true)
+                .await
+                .is_err()
+        );
     }
 
     /// Regression proof for the audit's Medium finding: `send_control_impl`
@@ -643,9 +1068,11 @@ mod tests {
         tx.try_send(voidframe_engine::run::ControlMsg::Pause)
             .unwrap(); // fill the channel to capacity so the next send blocks
 
+        let (shutdown_toggle_tx, _shutdown_toggle_rx) = watch::channel(false);
         let active = Arc::new(tokio::sync::Mutex::new(Some(crate::state::ActiveRun {
             run_id: "r1".into(),
             control_tx: tx,
+            shutdown_toggle_tx,
         })));
 
         let active_for_send = active.clone();
@@ -732,6 +1159,40 @@ mod tests {
         assert!(refuse_if_unresolved_run_state(&store).await.is_ok());
     }
 
+    #[tokio::test]
+    async fn refuses_to_start_with_a_distinct_message_when_a_run_is_waiting_to_resume() {
+        // A `RebootPending` snapshot isn't a crash -- it's a run
+        // deliberately waiting for `resume_run`, so the message must point
+        // at Resume, not Emergency Restore alone.
+        let dir = tempfile::tempdir().unwrap();
+        let root = voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let store = voidframe_engine::store::spawn_store(root);
+        store
+            .set_state(voidframe_engine::store::RunState {
+                schema_version: "1.1.0".into(),
+                run_id: "r1".into(),
+                project_id: "p1".into(),
+                phase: Phase::RebootPending {
+                    reason: voidframe_engine::run::phase::RebootReason::ApplyNext,
+                },
+                current_scenario: Some("s1".into()),
+                completed_scenarios: vec![],
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        let err = refuse_if_unresolved_run_state(&store).await.unwrap_err();
+        assert!(err.contains("Resume"), "{err}");
+        assert!(err.contains("Emergency Restore"), "{err}");
+    }
+
+    #[test]
+    fn is_resume_launch_impl_echoes_the_flag_it_is_given() {
+        assert_eq!(is_resume_launch_impl(true), Ok(true));
+        assert_eq!(is_resume_launch_impl(false), Ok(false));
+    }
+
     #[test]
     fn resolve_hwinfo_path_is_none_when_the_toggle_is_off_even_with_a_path_configured() {
         // The toggle and the path both have to be set for thermal mode to
@@ -754,6 +1215,26 @@ mod tests {
             resolve_hwinfo_path(true, Some(r"C:\HWiNFO64\HWiNFO64.exe".to_string())),
             Some(PathBuf::from(r"C:\HWiNFO64\HWiNFO64.exe"))
         );
+    }
+
+    #[test]
+    fn parse_mock_thermal_accepts_interval_ms_comma_count() {
+        assert_eq!(
+            parse_mock_thermal("250,40"),
+            Some((std::time::Duration::from_millis(250), 40))
+        );
+        assert_eq!(
+            parse_mock_thermal(" 5 , 2 "),
+            Some((std::time::Duration::from_millis(5), 2))
+        );
+    }
+
+    #[test]
+    fn parse_mock_thermal_rejects_garbage_and_zero_count() {
+        assert_eq!(parse_mock_thermal(""), None);
+        assert_eq!(parse_mock_thermal("250"), None);
+        assert_eq!(parse_mock_thermal("abc,3"), None);
+        assert_eq!(parse_mock_thermal("250,0"), None);
     }
 
     #[tokio::test]
@@ -783,12 +1264,14 @@ mod tests {
             voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
         let state = crate::state::AppState::with_data_root(data_root).unwrap();
         let (control_tx, _rx) = mpsc::channel(1);
+        let (shutdown_toggle_tx, _shutdown_toggle_rx) = watch::channel(false);
         *state.active_run.lock().await = Some(crate::state::ActiveRun {
             run_id: "r1".into(),
             control_tx,
+            shutdown_toggle_tx,
         });
 
-        let err = start_run_after_reservation(&state, "missing-project", "r1", false)
+        let err = start_run_after_reservation(&state, "missing-project", "r1", false, false)
             .await
             .unwrap_err();
         assert!(
@@ -817,5 +1300,234 @@ mod tests {
                 .is_err()
         );
         assert!(crate::commands::config::validate_presentmon_path(r"C:\nope\missing.exe").is_err());
+    }
+
+    /// Builds a minimal but valid `Project` for `resume_run_reserved`'s own
+    /// test -- field values themselves don't matter, only that `Project`
+    /// deserializes/round-trips cleanly as the progress's `project_override`.
+    #[cfg(feature = "mock-run")]
+    fn minimal_project(id: &str) -> Project {
+        Project {
+            schema_version: voidframe_engine::model::SCHEMA_VERSION.to_string(),
+            id: id.to_string(),
+            name: "P".into(),
+            description: "d".into(),
+            created_at: "2026-09-06T00:00:00Z".into(),
+            settings: serde_json::from_str("{}").unwrap(),
+            baseline: voidframe_engine::model::project::Baseline {
+                name: "Stock".into(),
+                description: "d".into(),
+            },
+            scenarios: vec![],
+        }
+    }
+
+    /// `resume_run_reserved` (spec §3.4): a `RebootPending` store snapshot
+    /// plus a matching on-disk `RunProgress` must resume via the mock-run
+    /// harness (`VOIDFRAME_SIMULATE_RUN`, so `prepare_run` never needs a
+    /// real PresentMon/HWiNFO/project.json), reserving `active_run` and
+    /// returning the progress's own run id -- `resume_run_impl` itself needs
+    /// a real `Wry` `AppHandle` this test can't construct (see
+    /// `resume_run_reserved`'s own doc comment), so this exercises the exact
+    /// same fallible chain up to (not including) `spawn_and_forward`.
+    #[cfg(feature = "mock-run")]
+    #[tokio::test]
+    async fn resume_run_reserved_resumes_a_reboot_pending_run_via_the_mock_harness() {
+        // SAFETY: this test is the only one in the crate that reads
+        // `VOIDFRAME_SIMULATE_RUN` (gated behind the `mock-run` feature,
+        // never compiled into a plain `cargo test`), and every other test in
+        // this module that reaches `prepare_run` without it either supplies
+        // no override and fails at `Project::load` before the env var is
+        // ever checked, or never calls `prepare_run` at all -- so a
+        // concurrently-running sibling test cannot observe this value.
+        unsafe {
+            std::env::set_var("VOIDFRAME_SIMULATE_RUN", "1");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_root =
+            voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let state = crate::state::AppState::with_data_root(data_root).unwrap();
+
+        let run_dir = state.data_root.run_dir("r1");
+        let progress = RunProgress {
+            schema_version: voidframe_engine::model::SCHEMA_VERSION.to_string(),
+            run_id: "r1".into(),
+            project: minimal_project("p1"),
+            start_build_id: None,
+            start_launch_args: String::new(),
+            start_launch_args_raw: String::new(),
+            start_power_plan: voidframe_engine::system::PowerPlan {
+                guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                name: "Balanced".into(),
+                active: true,
+            },
+            thermal_baseline: None,
+            completed: vec![],
+            unstable: vec![],
+            cursor: voidframe_engine::model::progress::Cursor {
+                index: 1,
+                stage: voidframe_engine::model::progress::Stage::Apply,
+            },
+            reboot: Some(voidframe_engine::model::progress::PendingReboot {
+                reason: voidframe_engine::run::phase::RebootReason::ApplyNext,
+                scenario_id: "s1".into(),
+                initiated_at: "2026-09-06T00:00:00Z".into(),
+                boot_count: 0,
+            }),
+            shutdown_when_complete: false,
+            skip_revert_once: false,
+            abort_requested: false,
+        };
+        progress.save(&run_dir).unwrap();
+
+        state
+            .store
+            .set_state(voidframe_engine::store::RunState {
+                schema_version: "1.1.0".into(),
+                run_id: "r1".into(),
+                project_id: "p1".into(),
+                phase: Phase::RebootPending {
+                    reason: voidframe_engine::run::phase::RebootReason::ApplyNext,
+                },
+                current_scenario: Some("s1".into()),
+                completed_scenarios: vec![],
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        let (prepared, loaded_progress, _control_rx, _shutdown_toggle_rx, returned_run_dir) =
+            resume_run_reserved(&state).await.unwrap();
+
+        assert_eq!(loaded_progress.run_id, "r1");
+        assert_eq!(prepared.config.run_id, "r1");
+        assert_eq!(returned_run_dir, run_dir);
+        assert!(
+            state.active_run.lock().await.is_some(),
+            "active_run must be reserved for the resumed run"
+        );
+
+        // SAFETY: see the matching `set_var` comment above.
+        unsafe {
+            std::env::remove_var("VOIDFRAME_SIMULATE_RUN");
+        }
+    }
+
+    /// The resume path's `project_override` comes straight out of
+    /// `progress.json` (user-writable) and used to bypass both checks
+    /// `Project::load` gives a project read from disk -- so a crafted
+    /// `project.id` was joined verbatim into `projects\<id>\scripts\` and its
+    /// scripts executed as Administrator on the next `--resume`.
+    #[tokio::test]
+    async fn prepare_run_rejects_a_project_override_with_a_traversal_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root =
+            voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let state = crate::state::AppState::with_data_root(data_root).unwrap();
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "schema_version": voidframe_engine::model::SCHEMA_VERSION,
+            "id": r"..\..\Users\Public\x", "name": "P", "description": "d",
+            "created_at": "2026-09-10T00:00:00Z", "settings": {},
+            "baseline": {"name": "Stock", "description": "d"},
+            "scenarios": [{
+                "id": "s1", "name": "S", "description": "d", "enabled": true,
+                "modules": [{
+                    "type": "custom_script", "apply_script": "apply.bat",
+                    "revert_script": "revert.bat", "requires_reboot": false,
+                    "description": "d"
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let err = prepare_run(&state, "ignored", "r1", false, Some(project), false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid project id"), "{err}");
+    }
+
+    /// A scenario id that is not a safe path segment is rejected the same way
+    /// -- it is joined into `journal-<id>.jsonl` by the run loop.
+    #[tokio::test]
+    async fn prepare_run_rejects_a_project_override_with_a_traversal_scenario_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root =
+            voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let state = crate::state::AppState::with_data_root(data_root).unwrap();
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "schema_version": voidframe_engine::model::SCHEMA_VERSION,
+            "id": "p1", "name": "P", "description": "d",
+            "created_at": "2026-09-10T00:00:00Z", "settings": {},
+            "baseline": {"name": "Stock", "description": "d"},
+            "scenarios": [{
+                "id": r"..\evil", "name": "S", "description": "d", "enabled": true,
+                "modules": []
+            }]
+        }))
+        .unwrap();
+
+        let err = prepare_run(&state, "ignored", "r1", false, Some(project), false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid id"), "{err}");
+    }
+
+    /// A resume interrupted during its post-boot settle leaves the store at
+    /// `BootResume`; `resume_run_reserved` must let it through to the
+    /// engine rather than refusing it forever. Without a `progress.json` on
+    /// disk the next failure is the load, proving the phase gate was passed.
+    #[tokio::test]
+    async fn resume_run_reserved_accepts_a_boot_resume_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root =
+            voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let state = crate::state::AppState::with_data_root(data_root).unwrap();
+        state
+            .store
+            .set_state(voidframe_engine::store::RunState {
+                schema_version: "1.1.0".into(),
+                run_id: "r1".into(),
+                project_id: "p1".into(),
+                phase: Phase::BootResume,
+                current_scenario: Some("s1".into()),
+                completed_scenarios: vec![],
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        let err = resume_run_reserved(&state).await.unwrap_err();
+        assert!(
+            !err.contains("not waiting for a reboot"),
+            "boot_resume must pass the phase gate: {err}"
+        );
+        assert!(
+            state.active_run.lock().await.is_none(),
+            "a failed reservation must not leave active_run set"
+        );
+    }
+
+    /// `start_run` must point a `BootResume` snapshot at Resume, not at
+    /// Emergency Restore -- the same message the `RebootPending` case gets.
+    #[tokio::test]
+    async fn start_run_refuses_a_boot_resume_snapshot_with_the_resume_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let store = voidframe_engine::store::spawn_store(root);
+        store
+            .set_state(voidframe_engine::store::RunState {
+                schema_version: "1.1.0".into(),
+                run_id: "r1".into(),
+                project_id: "p1".into(),
+                phase: Phase::BootResume,
+                current_scenario: Some("s1".into()),
+                completed_scenarios: vec![],
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let err = refuse_if_unresolved_run_state(&store).await.unwrap_err();
+        assert!(err.contains("use Resume on the dashboard"), "{err}");
     }
 }

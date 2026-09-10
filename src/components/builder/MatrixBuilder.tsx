@@ -1,8 +1,16 @@
 import React, { useState } from "react";
 import { Plus, Play, Trash2, BookOpen, Clock, ChevronRight, Wrench, Pencil, X } from "lucide-react";
-import type { Module, PowerPlan, Project, Scenario } from "../../lib/bindings";
+import type { CustomScriptPayload, Module, PowerPlan, Project, Scenario } from "../../lib/bindings";
 import { PowerPlanPicker } from "../library/PowerPlanPicker";
 import { LaunchArgsEditor } from "../library/LaunchArgsEditor";
+import { Cs2ConfigEditor } from "../library/Cs2ConfigEditor";
+import { CustomScriptEditor } from "../library/CustomScriptEditor";
+import { countReboots, estimateSeconds, scenarioRequiresReboot } from "../../lib/reboots";
+
+// `Config::default_post_boot_settle_seconds` (crates/voidframe-engine/src/model/config.rs) --
+// the builder's own estimate has no live Config to read (unlike Settings-owning
+// components), so it mirrors the engine's documented default rather than fetching one.
+const POST_BOOT_SETTLE_SECONDS_DEFAULT = 180;
 
 interface MatrixBuilderProps {
   project: Project;
@@ -21,6 +29,8 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
 }) => {
   const [activeScenarioId, setActiveScenarioId] = useState<string>(project.scenarios?.[0]?.id || "");
   const [editingModuleIndex, setEditingModuleIndex] = useState<number | null>(null);
+  const [renamingScenarioId, setRenamingScenarioId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
 
   // Combinatorial Calculations
   const enabledScenarios = (project.scenarios ?? []).filter((s) => s.enabled ?? true);
@@ -30,7 +40,13 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
   const totalMeasureRuns = (enabledScenarios.length + 1) * measureLoops;
   const totalRuns = totalWarmupRuns + totalMeasureRuns;
   const captureSeconds = project.settings.capture_seconds ?? 105;
-  const estimatedSeconds = totalRuns * (captureSeconds + 15);
+  const rebootCount = countReboots(enabledScenarios.map(scenarioRequiresReboot));
+  const estimatedSeconds = estimateSeconds(
+    totalRuns,
+    captureSeconds,
+    rebootCount,
+    POST_BOOT_SETTLE_SECONDS_DEFAULT
+  );
   const estimatedMinutes = Math.ceil(estimatedSeconds / 60);
 
   const handleToggleScenario = (scenarioId: string) => {
@@ -40,6 +56,32 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
         s.id === scenarioId ? { ...s, enabled: !(s.enabled ?? true) } : s
       ),
     });
+  };
+
+  const handleRenameScenario = (scenarioId: string, newName: string) => {
+    onUpdateProject({
+      ...project,
+      scenarios: (project.scenarios ?? []).map((s) =>
+        s.id === scenarioId ? { ...s, name: newName } : s
+      ),
+    });
+  };
+
+  const startRenaming = (scenarioId: string, currentName: string) => {
+    setRenamingScenarioId(scenarioId);
+    setRenameDraft(currentName);
+  };
+
+  const commitRename = (scenarioId: string) => {
+    const trimmed = renameDraft.trim();
+    if (trimmed.length > 0) {
+      handleRenameScenario(scenarioId, trimmed);
+    }
+    setRenamingScenarioId(null);
+  };
+
+  const cancelRename = () => {
+    setRenamingScenarioId(null);
   };
 
   const handleAddScenario = () => {
@@ -103,6 +145,24 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
     setEditingModuleIndex(null);
   };
 
+  const handleSaveCs2ConfigForModule = (
+    scenarioId: string,
+    moduleIndex: number,
+    settings: Record<string, string>
+  ) => {
+    handleUpdateModule(scenarioId, moduleIndex, { type: "cs2_config", settings });
+    setEditingModuleIndex(null);
+  };
+
+  const handleSaveCustomScriptForModule = (
+    scenarioId: string,
+    moduleIndex: number,
+    payload: CustomScriptPayload
+  ) => {
+    handleUpdateModule(scenarioId, moduleIndex, { type: "custom_script", ...payload });
+    setEditingModuleIndex(null);
+  };
+
   const currentScenario = (project.scenarios ?? []).find((s) => s.id === activeScenarioId);
   const modules = currentScenario?.modules ?? [];
 
@@ -138,7 +198,7 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
         </div>
 
         {/* Combinatorial Estimation Bar */}
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-3 pt-4 border-t border-white/10">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-4 border-t border-white/10">
           <div className="bg-black/30 border border-white/5 rounded-xl p-3">
             <div className="text-[10px] text-white/40 font-mono">SCENARIOS ACTIVE</div>
             <div className="font-mono text-lg font-bold text-white mt-0.5">
@@ -150,6 +210,13 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
             <div className="text-[10px] text-white/40 font-mono">TOTAL BENCH RUNS</div>
             <div className="font-mono text-lg font-bold text-white mt-0.5">
               {totalRuns} <span className="text-xs text-white/40 font-normal">({totalMeasureRuns}m + {totalWarmupRuns}w)</span>
+            </div>
+          </div>
+
+          <div className="bg-black/30 border border-white/5 rounded-xl p-3">
+            <div className="text-[10px] text-white/40 font-mono">REBOOTS</div>
+            <div className="font-mono text-lg font-bold text-amber-400 mt-0.5">
+              {rebootCount} reboot{rebootCount === 1 ? "" : "s"}
             </div>
           </div>
 
@@ -208,6 +275,7 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
                   onClick={() => {
                     setActiveScenarioId(scen.id);
                     setEditingModuleIndex(null);
+                    setRenamingScenarioId(null);
                   }}
                   className={`p-4 rounded-xl transition-all cursor-pointer flex items-center justify-between border ${
                     isSelected
@@ -222,6 +290,11 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
                     </div>
                     <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono text-white/50">
                       <span>{(scen.modules ?? []).length} modules</span>
+                      {scenarioRequiresReboot(scen) && (
+                        <span className="px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                          reboot
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -255,11 +328,37 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
                       ACTIVE SCENARIO
                     </span>
                   </div>
-                  <h3 className="font-sans font-bold text-xl text-white">{currentScenario.name}</h3>
+                  {renamingScenarioId === currentScenario.id ? (
+                    <input
+                      type="text"
+                      value={renameDraft}
+                      onChange={(e) => setRenameDraft(e.target.value)}
+                      onBlur={() => commitRename(currentScenario.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          commitRename(currentScenario.id);
+                        } else if (e.key === "Escape") {
+                          cancelRename();
+                        }
+                      }}
+                      aria-label="Scenario name"
+                      autoFocus
+                      className="px-2 py-1 rounded-lg glass-input font-sans font-bold text-xl text-white w-full max-w-xs"
+                    />
+                  ) : (
+                    <h3 className="font-sans font-bold text-xl text-white">{currentScenario.name}</h3>
+                  )}
                   <p className="text-xs text-white/60 font-body">{currentScenario.description}</p>
                 </div>
 
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => startRenaming(currentScenario.id, currentScenario.name)}
+                    title="Rename Scenario"
+                    className="p-2 rounded-lg text-white/40 hover:text-[#22d3ee] hover:bg-[#06b6d4]/10 border border-transparent hover:border-[#06b6d4]/20 transition-colors cursor-pointer"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </button>
                   <button
                     onClick={() => handleDeleteScenario(currentScenario.id)}
                     title="Delete Scenario"
@@ -313,7 +412,7 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
                               </span>
                             </div>
                             <div className="flex items-center gap-1">
-                              {(module.type === "power_plan" || module.type === "launch_args") && (
+                              {(module.type === "power_plan" || module.type === "launch_args" || module.type === "cs2_config" || module.type === "custom_script") && (
                                 <button
                                   onClick={() => setEditingModuleIndex(idx)}
                                   title="Edit Module"
@@ -399,6 +498,58 @@ export const MatrixBuilder: React.FC<MatrixBuilderProps> = ({
                                   initialValue={module.args}
                                   onSave={(args) =>
                                     handleSaveLaunchArgsForModule(currentScenario.id, idx, args)
+                                  }
+                                />
+                              </div>
+                            )}
+                            {module.type === "cs2_config" && (
+                              <div className="truncate text-white/50">
+                                <span className="text-[#22d3ee]">CS2 Config:</span>{" "}
+                                {Object.keys(module.settings).length} setting
+                                {Object.keys(module.settings).length === 1 ? "" : "s"}
+                              </div>
+                            )}
+                            {editingModuleIndex === idx && module.type === "cs2_config" && (
+                              <div className="pt-2 mt-2 border-t border-white/10 space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] uppercase text-white/40">Edit CS2 config</span>
+                                  <button
+                                    onClick={() => setEditingModuleIndex(null)}
+                                    className="text-white/40 hover:text-white p-1 rounded cursor-pointer"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                                <Cs2ConfigEditor
+                                  initialValue={module.settings}
+                                  onSave={(settings) =>
+                                    handleSaveCs2ConfigForModule(currentScenario.id, idx, settings)
+                                  }
+                                />
+                              </div>
+                            )}
+                            {module.type === "custom_script" && (
+                              <div className="truncate text-white/50">
+                                <span className="text-amber-300">Custom Script:</span> {module.description || module.apply_script}
+                                {module.requires_reboot && <span className="text-white/40"> (requires reboot)</span>}
+                              </div>
+                            )}
+                            {editingModuleIndex === idx && module.type === "custom_script" && (
+                              <div className="pt-2 mt-2 border-t border-white/10 space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] uppercase text-white/40">Edit custom script</span>
+                                  <button
+                                    onClick={() => setEditingModuleIndex(null)}
+                                    className="text-white/40 hover:text-white p-1 rounded cursor-pointer"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                                <CustomScriptEditor
+                                  projectId={project.id}
+                                  initialValue={module}
+                                  onSave={(payload) =>
+                                    handleSaveCustomScriptForModule(currentScenario.id, idx, payload)
                                   }
                                 />
                               </div>

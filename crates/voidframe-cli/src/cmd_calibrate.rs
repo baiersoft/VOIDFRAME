@@ -29,7 +29,7 @@ use voidframe_engine::model::project::{Baseline, Project, Scenario};
 use voidframe_engine::model::results::{Metrics, Verdict};
 use voidframe_engine::model::{SCHEMA_VERSION, Settings};
 use voidframe_engine::run::execute::RunConfig;
-use voidframe_engine::run::{ControlMsg, EngineEvent};
+use voidframe_engine::run::{ControlMsg, EngineEvent, RunOutcome, RunStart};
 
 use crate::calibrate_stats::{CALIBRATION_METRICS, compare_metric};
 use crate::harness::select_backend;
@@ -182,6 +182,10 @@ pub async fn run(
     let run_id = uuid::Uuid::new_v4().to_string();
 
     let (control_tx, control_rx) = tokio::sync::mpsc::channel(16);
+    // `voidframe-cli` is headless -- nothing here can ever toggle
+    // `shutdown_when_complete` mid-run, so the sender is just dropped. Seeded
+    // `false` to match `config.shutdown_when_complete` below.
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
 
     let config = RunConfig {
         project,
@@ -194,9 +198,18 @@ pub async fn run(
         thermal_sample_override: None,
         inter_scenario_break_seconds: break_seconds,
         hwinfo_path: None,
+        shutdown_when_complete: false,
+        post_boot_settle: std::time::Duration::from_secs(180),
+        exe_path: std::env::current_exe()?,
     };
 
-    let mut run = voidframe_engine::run::spawn_run(sys, capture, config, control_rx);
+    let mut run = voidframe_engine::run::spawn_run(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        control_rx,
+        shutdown_toggle_rx,
+    );
 
     let mut failed = false;
     while let Some(ev) = run.events.recv().await {
@@ -227,6 +240,13 @@ pub async fn run(
     if failed {
         anyhow::bail!("calibration run failed");
     }
+    // Calibration never configures a reboot-requiring module, so a
+    // calibration run always either completes or fails -- `RebootPending`/
+    // `ShutdownRequested` are M3 outcomes for real benchmark projects,
+    // not this command.
+    let RunOutcome::Complete(result) = result else {
+        anyhow::bail!("calibration run ended in an unexpected outcome: {result:?}");
+    };
 
     // Concatenated in order regardless of mode: with fresh_cs2_per_iteration
     // off, `result.scenarios` is empty, so this is exactly `baseline.

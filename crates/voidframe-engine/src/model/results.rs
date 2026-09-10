@@ -106,6 +106,17 @@ pub struct ScenarioResult {
     pub metric_deltas: Vec<MetricDelta>,
     pub wcps: f64,
     pub verdict: Verdict,
+    /// Spec section 6 / D6: true once this scenario's `custom_script`
+    /// module completed a revert -- VOIDFRAME ran the script but never
+    /// verified its actual effect. Can't be set at construction time:
+    /// `scenario_result` builds this struct during `Stage::Measure`, which
+    /// runs *before* `Stage::Revert` (and the scenario's own custom_script
+    /// revert) at all, so `run/execute/mod.rs`'s `Stage::Revert` arm patches
+    /// this field into the already-recorded result after a real revert
+    /// completes. `#[serde(default)]` for back-compat with `results.json`
+    /// files already on disk.
+    #[serde(default)]
+    pub script_reverted_unverified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,6 +129,14 @@ pub struct RunResults {
     pub detection_tier: DetectionTier,
     pub baseline: ScenarioResult,
     pub scenarios: Vec<ScenarioResult>,
+    /// Scenarios `begin_resume` reverted and set aside after a non-clean
+    /// boot (spec §4) -- carried over from `RunProgress::unstable` at
+    /// REPORT, since `progress.json` is removed once a run completes and
+    /// this is otherwise the only record that they were skipped.
+    /// `#[serde(default)]` for back-compat with `results.json` files
+    /// already on disk.
+    #[serde(default)]
+    pub unstable: Vec<crate::model::progress::UnstableScenario>,
 }
 
 /// A lightweight summary of a `RunResults` for a results-history listing UI
@@ -172,17 +191,82 @@ fn utc_timestamp_from_unix(secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// Inverse of [`utc_timestamp_now`] for the fixed `YYYY-MM-DDTHH:MM:SSZ`
+/// shape this crate writes; `None` for anything else.
+pub fn parse_utc_timestamp(s: &str) -> Option<std::time::SystemTime> {
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| s.get(from..to)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hh, mm, ss) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    // days_from_civil (Howard Hinnant, public domain)
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss;
+    u64::try_from(secs)
+        .ok()
+        .map(|s| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s))
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn parse_round_trips_now_to_second_precision() {
+        let now = utc_timestamp_now();
+        let parsed = parse_utc_timestamp(&now).unwrap();
+        let back = parsed
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let real = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(real.abs_diff(back) <= 2);
+        assert_eq!(
+            parse_utc_timestamp("2026-09-06T00:00:00Z").unwrap(),
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_788_652_800)
+        );
+        assert!(parse_utc_timestamp("garbage").is_none());
+    }
+}
+
 impl RunResults {
-    /// `winner` is the highest-`wcps` entry among `scenarios` -- baseline
-    /// is never a candidate (mirrors `ResultsVisualizer.tsx`'s own
-    /// `sortedScenarios[0]`). `None` for a baseline-only run (e.g. a
-    /// calibration-shaped session with zero real scenarios).
+    /// `winner` is the highest-`wcps` entry among `scenarios` whose own
+    /// `verdict` is `Verdict::Better` -- baseline is never a candidate
+    /// (mirrors `ResultsVisualizer.tsx`'s own gated `winner`), and neither
+    /// is a `Worse`/`NoMeasurableDifference`/`Inconclusive`/`ConfirmedSame`
+    /// scenario: a scenario
+    /// that didn't statistically beat baseline must never be reported as
+    /// the "winner" just because it happens to be the only (or
+    /// least-bad) one being compared. Confirmed as a real bug on alpha-
+    /// tester data where the only non-baseline scenario was `Worse`:
+    /// study/pamuk/ab-test-analysis-report.md §7. `None` for a run with no
+    /// `Better` scenario at all (including a baseline-only run).
     pub fn summarize(&self) -> RunSummary {
-        let winner = self.scenarios.iter().max_by(|a, b| {
-            a.wcps
-                .partial_cmp(&b.wcps)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let winner = self
+            .scenarios
+            .iter()
+            .filter(|s| s.verdict == Verdict::Better)
+            .max_by(|a, b| {
+                a.wcps
+                    .partial_cmp(&b.wcps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         RunSummary {
             run_id: self.run_id.clone(),
             project_id: self.project_id.clone(),
@@ -276,6 +360,7 @@ mod tests {
             metric_deltas: vec![],
             wcps: 0.0,
             verdict: Verdict::ConfirmedSame,
+            script_reverted_unverified: false,
         };
         let low = ScenarioResult {
             scenario_id: "s1".into(),
@@ -286,6 +371,7 @@ mod tests {
             metric_deltas: vec![],
             wcps: 1.0,
             verdict: Verdict::Better,
+            script_reverted_unverified: false,
         };
         let high = ScenarioResult {
             scenario_id: "s2".into(),
@@ -296,6 +382,7 @@ mod tests {
             metric_deltas: vec![],
             wcps: 5.0,
             verdict: Verdict::Better,
+            script_reverted_unverified: false,
         };
         let rr = RunResults {
             schema_version: "1.0.0".into(),
@@ -305,6 +392,7 @@ mod tests {
             detection_tier: DetectionTier::LogTail,
             baseline,
             scenarios: vec![low, high],
+            unstable: vec![],
         };
 
         let summary = rr.summarize();
@@ -314,6 +402,57 @@ mod tests {
         assert_eq!(summary.run_id, "r1");
         assert_eq!(summary.project_id, "p1");
         assert_eq!(summary.completed_at, "2026-09-01T01:00:00Z");
+    }
+
+    #[test]
+    fn summarize_reports_no_winner_when_the_only_scenario_is_worse() {
+        // Regression test for study/pamuk/ab-test-analysis-report.md §7:
+        // the frontend/backend "winner" concept must never crown a scenario
+        // the statistics themselves call Worse, even when it's the only
+        // scenario being compared against baseline (trivially "top-ranked"
+        // by wcps alone, which is exactly the bug -- a negative wcps still
+        // sorts above nothing).
+        let baseline = ScenarioResult {
+            scenario_id: "baseline".into(),
+            name: "Stock".into(),
+            is_baseline: true,
+            aggregated: dummy_metrics(),
+            per_iteration: vec![],
+            metric_deltas: vec![],
+            wcps: 0.0,
+            verdict: Verdict::ConfirmedSame,
+            script_reverted_unverified: false,
+        };
+        let worse = ScenarioResult {
+            scenario_id: "s1".into(),
+            name: "Exclude Core 0".into(),
+            is_baseline: false,
+            aggregated: dummy_metrics(),
+            per_iteration: vec![],
+            metric_deltas: vec![],
+            wcps: -4.9,
+            verdict: Verdict::Worse,
+            script_reverted_unverified: false,
+        };
+        let rr = RunResults {
+            schema_version: "1.0.0".into(),
+            run_id: "r1".into(),
+            project_id: "p1".into(),
+            completed_at: "2026-09-01T01:00:00Z".into(),
+            detection_tier: DetectionTier::LogTail,
+            baseline,
+            scenarios: vec![worse],
+            unstable: vec![],
+        };
+
+        let summary = rr.summarize();
+        assert_eq!(
+            summary.winner_name, None,
+            "a Worse-verdict scenario must never be reported as the winner, even if it's the \
+             only scenario"
+        );
+        assert_eq!(summary.winner_wcps, None);
+        assert_eq!(summary.scenario_count, 2);
     }
 
     #[test]
@@ -327,6 +466,7 @@ mod tests {
             metric_deltas: vec![],
             wcps: 0.0,
             verdict: Verdict::ConfirmedSame,
+            script_reverted_unverified: false,
         };
         let rr = RunResults {
             schema_version: "1.0.0".into(),
@@ -336,6 +476,7 @@ mod tests {
             detection_tier: DetectionTier::LogTail,
             baseline,
             scenarios: vec![],
+            unstable: vec![],
         };
 
         let summary = rr.summarize();
@@ -378,6 +519,7 @@ mod tests {
             }],
             wcps: 0.0,
             verdict: Verdict::ConfirmedSame,
+            script_reverted_unverified: false,
         };
         let rr = RunResults {
             schema_version: "1.0.0".into(),
@@ -387,6 +529,7 @@ mod tests {
             detection_tier: DetectionTier::FixedWindow,
             baseline: sr.clone(),
             scenarios: vec![],
+            unstable: vec![],
         };
         rr.save(&p).unwrap();
         let back: RunResults = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
@@ -425,6 +568,7 @@ mod tests {
             metric_deltas: vec![],
             wcps: 0.0,
             verdict: Verdict::ConfirmedSame,
+            script_reverted_unverified: false,
         };
         let rr = RunResults {
             schema_version: "1.0.0".into(),
@@ -434,6 +578,7 @@ mod tests {
             detection_tier: DetectionTier::FixedWindow,
             baseline: sr,
             scenarios: vec![],
+            unstable: vec![],
         };
         rr.save(&p).unwrap();
         let loaded = RunResults::load(&p).unwrap();

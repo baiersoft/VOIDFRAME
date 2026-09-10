@@ -111,5 +111,116 @@ describe("ProjectExplorer", () => {
     );
     expect(screen.queryByRole("button", { name: /\d+ runs?/i })).not.toBeInTheDocument();
   });
+
+  it("shows a Resume run button when the crashed run is waiting on a reboot, and calls onResumeRun", () => {
+    const onResumeRun = vi.fn();
+    render(
+      <ProjectExplorer
+        projects={[project()]}
+        onSelectProject={vi.fn()}
+        onEditMatrix={vi.fn()}
+        onRunProject={vi.fn()}
+        onViewResults={vi.fn()}
+        onCreateNew={vi.fn()}
+        isStarting={false}
+        crashedRun={{
+          schema_version: "1.0.0",
+          run_id: "r1",
+          project_id: "p1",
+          phase: { kind: "reboot_pending", reason: "apply_next" },
+          current_scenario: "s1",
+          completed_scenarios: [],
+          revision: 3,
+        }}
+        onResumeRun={onResumeRun}
+      />
+    );
+    const resumeButton = screen.getByRole("button", { name: /resume run/i });
+    fireEvent.click(resumeButton);
+    expect(onResumeRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a Resume run button when the crashed run is mid-resume after a reboot (boot_resume), and calls onResumeRun", () => {
+    const onResumeRun = vi.fn();
+    render(
+      <ProjectExplorer
+        projects={[project()]}
+        onSelectProject={vi.fn()}
+        onEditMatrix={vi.fn()}
+        onRunProject={vi.fn()}
+        onViewResults={vi.fn()}
+        onCreateNew={vi.fn()}
+        isStarting={false}
+        crashedRun={{
+          schema_version: "1.0.0",
+          run_id: "r1",
+          project_id: "p1",
+          phase: { kind: "boot_resume" },
+          current_scenario: "s1",
+          completed_scenarios: [],
+          revision: 3,
+        }}
+        onResumeRun={onResumeRun}
+      />
+    );
+    const resumeButton = screen.getByRole("button", { name: /resume run/i });
+    fireEvent.click(resumeButton);
+    expect(onResumeRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a Resume run button for a crashed run in a non-reboot-pending phase", () => {
+    render(
+      <ProjectExplorer
+        projects={[project()]}
+        onSelectProject={vi.fn()}
+        onEditMatrix={vi.fn()}
+        onRunProject={vi.fn()}
+        onViewResults={vi.fn()}
+        onCreateNew={vi.fn()}
+        isStarting={false}
+        crashedRun={{
+          schema_version: "1.0.0",
+          run_id: "r1",
+          project_id: "p1",
+          phase: { kind: "rollback" },
+          current_scenario: null,
+          completed_scenarios: [],
+          revision: 1,
+        }}
+        onResumeRun={vi.fn()}
+      />
+    );
+    expect(screen.queryByRole("button", { name: /resume run/i })).not.toBeInTheDocument();
+  });
+
+  it("shows an AveYo badge for an AveYo-kind project, and no badge for Dust2", () => {
+    render(
+      <ProjectExplorer
+        projects={[project({ id: "p1", name: "AveYo Project", settings: { benchmark_kind: "aveyo_cfg_v2" } })]}
+        onSelectProject={vi.fn()}
+        onEditMatrix={vi.fn()}
+        onRunProject={vi.fn()}
+        onViewResults={vi.fn()}
+        onCreateNew={vi.fn()}
+        isStarting={false}
+      />
+    );
+    expect(screen.getByText("AveYo benchmark.cfg v2")).toBeInTheDocument();
+  });
+
+  it("shows no benchmark badge for a Dust2-kind project", () => {
+    render(
+      <ProjectExplorer
+        projects={[project({ id: "p2", name: "Dust2 Project", settings: { benchmark_kind: "workshop_dust2" } })]}
+        onSelectProject={vi.fn()}
+        onEditMatrix={vi.fn()}
+        onRunProject={vi.fn()}
+        onViewResults={vi.fn()}
+        onCreateNew={vi.fn()}
+        isStarting={false}
+      />
+    );
+    expect(screen.queryByText(/AveYo/i)).not.toBeInTheDocument();
+  });
 });
 

@@ -373,8 +373,18 @@ async fn rollback_restores_run_start_launch_options_after_a_scenario_changed_the
     let (events_tx, events_rx) = mpsc::channel(256);
     let (_control_tx, control_rx) = mpsc::channel(4);
     let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
 
-    let result = execute(sys, capture, config, events_tx, control_rx, abort_rx).await;
+    let result = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    )
+    .await;
     drop(events_rx);
 
     result.expect("run should complete successfully");
@@ -425,8 +435,18 @@ async fn rollback_does_not_restore_when_baseline_never_reconciled_launch_options
     let (events_tx, events_rx) = mpsc::channel(256);
     let (_control_tx, control_rx) = mpsc::channel(4);
     let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
 
-    let result = execute(sys, capture, config, events_tx, control_rx, abort_rx).await;
+    let result = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    )
+    .await;
     drop(events_rx);
 
     assert!(
@@ -445,24 +465,21 @@ async fn rollback_does_not_restore_when_baseline_never_reconciled_launch_options
     );
 }
 
-/// Mirror case for docs/superpowers/sdd/2026-09-05-run-lifecycle-review-fixes.md task 7: a run
-/// whose scenarios (baseline included) never carry a `Module::LaunchArgs` at
-/// all must not have ROLLBACK write anything -- restoring to
-/// `reconcile(ctx.start_launch_args)` is exactly what BASELINE already wrote,
-/// so this is a genuine no-op, not a redundant rewrite (which would cost an
-/// unnecessary Steam kill/relaunch cycle). Asserts a call count (the
-/// smallest counter `MockController` didn't already expose) rather than only
-/// the final value, since the final value alone can't distinguish "never
-/// written again" from "written again with the same value".
+/// A run whose scenarios (baseline included) never carry a
+/// `Module::LaunchArgs` still gets its launch options restored to the true
+/// pristine pre-run string at ROLLBACK -- not left at whatever BASELINE's
+/// own reconciled write produced. `write_launch_options_calls()` must be 2:
+/// BASELINE's own write, then ROLLBACK's restore.
 #[tokio::test]
-async fn rollback_is_a_no_op_when_no_scenario_ever_had_a_launch_args_module() {
+async fn rollback_restores_pristine_options_even_when_no_scenario_ever_had_a_launch_args_module() {
     tokio::time::pause();
     let dir = tempfile::tempdir().unwrap();
     write_signatures(dir.path());
     let settings = settings_with(0, 3, 5);
     // Deliberately NOT already reconciled -- this is what makes BASELINE
-    // itself perform exactly one kill/write/relaunch cycle (the only write
-    // this whole run should ever make).
+    // itself perform exactly one kill/write/relaunch cycle (BASELINE's own
+    // write, the first of the two this run now makes -- see this test's
+    // own tail assertion for the second, ROLLBACK's restore).
     let mock = MockController::new()
         .with_steam_status(SteamStatus {
             running: true,
@@ -495,22 +512,31 @@ async fn rollback_is_a_no_op_when_no_scenario_ever_had_a_launch_args_module() {
     let (events_tx, events_rx) = mpsc::channel(256);
     let (_control_tx, control_rx) = mpsc::channel(4);
     let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
 
-    let result = execute(sys, capture, config, events_tx, control_rx, abort_rx).await;
+    let result = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    )
+    .await;
     drop(events_rx);
 
     result.expect("run should complete successfully");
 
-    let expected = crate::cs2::keybind_cfg::reconcile("-high -threads 8");
     assert_eq!(
         mock.read_cs2_launch_options().await.unwrap(),
-        expected,
-        "the final launch options must be exactly what BASELINE wrote"
+        "-high -threads 8",
+        "ROLLBACK must restore the true pristine pre-run string, not leave BASELINE's own \
+         reconciled write in place"
     );
     assert_eq!(
         mock.write_launch_options_calls(),
-        1,
-        "ROLLBACK must not write launch options again when the last scenario had no \
-         Module::LaunchArgs -- BASELINE's own write is the only one this run should make"
+        2,
+        "BASELINE's own write, then ROLLBACK's restore -- exactly 2 writes total"
     );
 }

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { Minus, Square, Copy, X } from "lucide-react";
 import {
+  getAppVersion,
   isWindowMaximized,
   minimizeWindow,
   toggleMaximizeWindow,
@@ -9,6 +10,7 @@ import {
 
 export const TitleBar: React.FC = () => {
   const [isMaximized, setIsMaximized] = useState(false);
+  const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
     const checkState = async () => {
@@ -28,6 +30,14 @@ export const TitleBar: React.FC = () => {
 
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    getAppVersion()
+      .then(setVersion)
+      .catch(() => {
+        // Outside Tauri runtime (e.g. browser) -- badge stays hidden.
+      });
   }, []);
 
   const handleMinimize = async () => {
@@ -78,9 +88,11 @@ export const TitleBar: React.FC = () => {
         <span className="font-mono text-[11px] font-bold tracking-[0.2em] text-white/90">
           baiersoft <span className="text-[#06b6d4]">//</span> VOIDFRAME
         </span>
-        <span className="px-1.5 py-0.2 rounded text-[9px] font-mono bg-[#06b6d4]/10 text-[#22d3ee] border border-[#06b6d4]/30 ml-1">
-          v0.1.0-RC
-        </span>
+        {version && (
+          <span className="px-1.5 py-0.2 rounded text-[9px] font-mono bg-[#06b6d4]/10 text-[#22d3ee] border border-[#06b6d4]/30 ml-1">
+            v{version}-ALPHA
+          </span>
+        )}
       </div>
 
       {/* Center: Draggable Area */}

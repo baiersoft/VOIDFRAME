@@ -84,47 +84,34 @@ pub(crate) async fn rollback_now_impl(
          otherwise."
             .to_string()
     })?;
-    // Both of these are disk-sourced (read back out of `state/current.json`,
-    // which a non-elevated process can rewrite) and both get joined into a
-    // filesystem path this elevated process then opens. `scenario_id`
-    // ultimately traces back to `Scenario.id` in a project.json -- now also
-    // validated at the producing end, in `Project::validate` -- and
-    // `run_id` to `start_run`'s own uuid. Validate both here regardless:
-    // this is the read side, and it must not depend on the writer having
-    // been well-behaved.
+    // All three of these are disk-sourced (read back out of `state/current.json`,
+    // which a non-elevated process can rewrite) and all three get joined into a
+    // filesystem path this elevated process then opens (`journal_path` and, for
+    // `project_id`, `project_dir` below -- resolved into a `custom_script`
+    // module's `scripts/` directory during revert). `scenario_id` ultimately
+    // traces back to `Scenario.id` in a project.json -- now also validated at
+    // the producing end, in `Project::validate` -- and `run_id`/`project_id` to
+    // `start_run`'s own uuid/project selection. Validate all three here
+    // regardless: this is the read side, and it must not depend on the writer
+    // having been well-behaved.
     validate_project_id(scenario_id)?;
     validate_project_id(&snapshot.run_id)?;
+    validate_project_id(&snapshot.project_id)?;
     let journal_path = data_root
         .join("runs")
         .join(&snapshot.run_id)
         .join(format!("journal-{scenario_id}.jsonl"));
-    revert_all(&journal_path, sys)
+    let project_dir = data_root.join("projects").join(&snapshot.project_id);
+    revert_all(&project_dir, &journal_path, sys)
         .await
         .map_err(|e| e.to_string())
 }
 
-/// A journal file name looks like `journal-<scenario_id>.jsonl`.
-fn is_journal_name(name: &str) -> bool {
-    name.starts_with("journal-") && name.ends_with(".jsonl")
-}
-
-/// Lists every `journal-*.jsonl` file directly inside `dir`.
+/// Lists every `journal-*.jsonl` file directly inside `dir` -- the engine's
+/// own glob (`journal::live::journal_paths`), so this file and
+/// `recover.rs`/`restore_script.rs` agree on what a journal file is called.
 fn journals_in(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
-    let mut journals = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        let is_journal = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(is_journal_name)
-            .unwrap_or(false);
-        if is_journal {
-            journals.push(path);
-        }
-    }
-    Ok(journals)
+    voidframe_engine::journal::live::journal_paths(dir).map_err(|e| e.to_string())
 }
 
 /// The purely synchronous half of [`emergency_rollback_impl`]: scans
@@ -135,7 +122,9 @@ fn journals_in(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 /// for being newest. Split out so the whole filesystem scan -- two
 /// `std::fs::read_dir` passes plus a `metadata()` per entry -- can run as a
 /// single `spawn_blocking` closure, off the async command's own task.
-fn find_most_recent_run_journals(runs_dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+fn find_most_recent_run_journals(
+    runs_dir: &Path,
+) -> Result<(std::path::PathBuf, Vec<std::path::PathBuf>), String> {
     let entries = std::fs::read_dir(runs_dir).map_err(|e| e.to_string())?;
     let mut qualifying_dirs: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
     for entry in entries {
@@ -161,30 +150,60 @@ fn find_most_recent_run_journals(runs_dir: &Path) -> Result<Vec<std::path::PathB
         .max_by_key(|(_, m)| *m)
         .ok_or_else(|| "no runs found to roll back".to_string())?;
 
-    journals_in(&most_recent)
+    let journals = journals_in(&most_recent)?;
+    Ok((most_recent, journals))
 }
 
+/// Returns the reports alongside the run directory that was actually
+/// reverted -- `rollback_now`/`emergency_rollback`'s own post-clean-revert
+/// cleanup (deregistering the recovery tasks, removing the restore script,
+/// deleting that run's `progress.json`) needs to know which run this was,
+/// and re-scanning `runs_dir` a second time after the revert risks picking
+/// a different directory if mtimes changed in between.
 pub(crate) async fn emergency_rollback_impl(
     sys: &dyn SystemController,
+    data_root: &Path,
     runs_dir: &Path,
     active_run: &AsyncMutex<Option<ActiveRun>>,
-) -> Result<Vec<RevertReport>, String> {
+) -> Result<(std::path::PathBuf, Vec<RevertReport>), String> {
     // Held until this function returns -- see `reject_if_run_active`'s doc
     // comment for why the guard, not just the initial check, must span the
     // whole operation (including every `revert_all` call in the loop below).
     let _active_run_guard = reject_if_run_active(active_run).await?;
 
     let runs_dir = runs_dir.to_path_buf();
-    let journal_paths =
+    let (run_dir, journal_paths) =
         tokio::task::spawn_blocking(move || find_most_recent_run_journals(&runs_dir))
             .await
             .map_err(|e| super::join_error_to_string("emergency_rollback scan", e))??;
 
+    // Unlike `rollback_now_impl`, there is no live store `RunState` here to
+    // read a `project_id` off of -- this is the always-available panic
+    // button, working purely from what's on disk. Shares
+    // `crates/voidframe-engine/src/recover.rs`'s resolution of the identical
+    // problem (a run directory found on disk, nothing else handed in): that
+    // run's own `progress.json`, else its `results.json` (a run that
+    // finished normally has no `progress.json` left, only journals and
+    // results), validated as a path segment (JSON-sourced -- same threat
+    // class `rollback_now_impl` already guards `project_id` against above).
+    // Run directories are named by run uuid, never project id, so the
+    // directory name is no fallback. With neither file readable, a
+    // `custom_script` revert fails to find its script and reports that in
+    // `verify_failures`.
+    let project_dir = match voidframe_engine::recover::project_id_for_run(&run_dir) {
+        Some(id) => data_root.join("projects").join(id),
+        None => data_root.join("projects").join("<unknown>"),
+    };
+
     let mut reports = Vec::new();
     for path in journal_paths {
-        reports.push(revert_all(&path, sys).await.map_err(|e| e.to_string())?);
+        reports.push(
+            revert_all(&project_dir, &path, sys)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
     }
-    Ok(reports)
+    Ok((run_dir, reports))
 }
 
 /// Whether a rollback's report(s) are clean enough to also resolve the
@@ -203,12 +222,61 @@ fn revert_was_clean(reports: &[RevertReport]) -> bool {
     reports.iter().all(|r| r.verify_failures.is_empty())
 }
 
+/// After a clean revert, the run this reverted is truly done -- also
+/// deregisters both recovery scheduled tasks (a stale
+/// `VOIDFRAME_Resume`/`VOIDFRAME_Deadman` from this run must not fire
+/// against a machine that's already been rolled back), removes
+/// `VOIDFRAME_RESTORE.bat` (Desktop + its `recovery\` mirror, spec §5.3 --
+/// nothing left to restore from once this rollback has run), and deletes
+/// `run_dir`'s `progress.json` (spec §3.1 -- a stale on-disk cursor could
+/// otherwise make a later `--resume` try to pick this run back up after
+/// Emergency Restore/`rollback_now` already tore it down). Best-effort and
+/// independently logged: the revert itself already succeeded by the time
+/// this runs, and none of these three steps failing should look like the
+/// rollback itself failed.
+async fn cleanup_after_clean_revert(sys: &dyn SystemController, data_root: &Path, run_dir: &Path) {
+    for name in [
+        voidframe_engine::system::RESUME_TASK_NAME,
+        voidframe_engine::system::DEADMAN_TASK_NAME,
+    ] {
+        if let Err(e) = sys.deregister_task(name).await {
+            log::warn!("failed to remove scheduled task {name} after a clean rollback: {e}");
+        }
+    }
+    // Both restore-script targets (Desktop + its `recovery\` mirror) are
+    // process-wide, not per-run -- `remove_all` wants the data root. Both
+    // removals are synchronous filesystem calls, so they run on
+    // `spawn_blocking` like every other blocking-fs call in `commands/*.rs`.
+    let data_root = data_root.to_path_buf();
+    let progress_path = run_dir.join(voidframe_engine::model::progress::PROGRESS_FILE);
+    let removal = tokio::task::spawn_blocking(move || {
+        voidframe_engine::journal::restore_script::remove_all(&data_root);
+        match std::fs::remove_file(&progress_path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                log::warn!(
+                    "failed to remove {} after a clean rollback: {e}",
+                    progress_path.display()
+                );
+            }
+            _ => {}
+        }
+    })
+    .await;
+    if let Err(e) = removal {
+        log::warn!(
+            "{}",
+            super::join_error_to_string("post-rollback cleanup", e)
+        );
+    }
+}
+
 #[specta::specta]
 #[tauri::command]
 pub async fn rollback_now(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<RevertReport, String> {
     let snapshot = state.store.snapshot().await.map_err(|e| e.to_string())?;
+    let run_id = snapshot.as_ref().map(|s| s.run_id.clone());
     let report = rollback_now_impl(
         state.sys.as_ref(),
         snapshot,
@@ -222,6 +290,14 @@ pub async fn rollback_now(
     // happens.
     if revert_was_clean(std::slice::from_ref(&report)) {
         let _ = state.store.clear().await;
+        if let Some(run_id) = run_id {
+            cleanup_after_clean_revert(
+                state.sys.as_ref(),
+                state.data_root.path(),
+                &state.data_root.run_dir(&run_id),
+            )
+            .await;
+        }
     }
     Ok(report)
 }
@@ -231,14 +307,16 @@ pub async fn rollback_now(
 pub async fn emergency_rollback(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<Vec<RevertReport>, String> {
-    let reports = emergency_rollback_impl(
+    let (run_dir, reports) = emergency_rollback_impl(
         state.sys.as_ref(),
+        state.data_root.path(),
         &state.data_root.runs_dir(),
         &state.active_run,
     )
     .await?;
     if revert_was_clean(&reports) {
         let _ = state.store.clear().await;
+        cleanup_after_clean_revert(state.sys.as_ref(), state.data_root.path(), &run_dir).await;
     }
     Ok(reports)
 }
@@ -291,6 +369,66 @@ mod tests {
             },
         ];
         assert!(!revert_was_clean(&reports));
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_clean_revert_deregisters_tasks_removes_restore_script_and_progress_json()
+    {
+        let sys = MockController::new();
+        sys.register_task(&voidframe_engine::system::TaskSpec {
+            name: voidframe_engine::system::RESUME_TASK_NAME.into(),
+            description: "r1".into(),
+            trigger: voidframe_engine::system::TaskTrigger::AtLogonOfCurrentUser,
+            principal: voidframe_engine::system::TaskPrincipal::CurrentUserHighest,
+            exe: std::path::PathBuf::from("voidframe.exe"),
+            args: "--resume".into(),
+        })
+        .await
+        .unwrap();
+        sys.register_task(&voidframe_engine::system::TaskSpec {
+            name: voidframe_engine::system::DEADMAN_TASK_NAME.into(),
+            description: "r1".into(),
+            trigger: voidframe_engine::system::TaskTrigger::AtBootDelayed { minutes: 10 },
+            principal: voidframe_engine::system::TaskPrincipal::LocalSystem,
+            exe: std::path::PathBuf::from("voidframe.exe"),
+            args: "--recover".into(),
+        })
+        .await
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("runs").join("r1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("progress.json"), "{}").unwrap();
+        let restore_bat = dir.path().join("recovery").join("VOIDFRAME_RESTORE.bat");
+        std::fs::create_dir_all(restore_bat.parent().unwrap()).unwrap();
+        std::fs::write(&restore_bat, "@echo off").unwrap();
+
+        cleanup_after_clean_revert(&sys, dir.path(), &run_dir).await;
+
+        assert!(
+            sys.registered_tasks().is_empty(),
+            "both tasks must be deregistered"
+        );
+        assert!(
+            !run_dir.join("progress.json").exists(),
+            "progress.json must be removed"
+        );
+        assert!(!restore_bat.exists(), "the restore script must be removed");
+    }
+
+    #[tokio::test]
+    async fn cleanup_after_clean_revert_tolerates_a_missing_progress_json() {
+        // Not every reverted run reached the reboot-capable cursor-driven
+        // loop that writes `progress.json` at all (an M1/M2-era run never
+        // does) -- a missing file must not be treated as a failure.
+        let sys = MockController::new();
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("runs").join("r1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        cleanup_after_clean_revert(&sys, dir.path(), &run_dir).await;
+        // No panic, no error surfaced -- best-effort by design.
     }
 
     #[tokio::test]
@@ -371,6 +509,7 @@ mod tests {
                 setting: "IDLEDISABLE".into(),
                 value: 1,
             },
+            dir.path(),
             &sys,
             &mut journal,
             &voidframe_engine::system::MutationCtx {
@@ -378,6 +517,9 @@ mod tests {
                 scenario_id: "s2".into(),
                 step_index: 0,
             },
+            // No live run here, so nothing observes this shield -- see
+            // `mutation::apply_module`'s own `no_return` doc.
+            &tokio::sync::watch::channel(false).0,
         )
         .await
         .unwrap();
@@ -462,9 +604,11 @@ mod tests {
         std::fs::write(run_dir.join("journal-s1.jsonl"), "").unwrap();
         std::fs::write(run_dir.join("results.json"), "{}").unwrap(); // a non-journal file present must not break the scan
 
-        let reports = emergency_rollback_impl(&sys, &runs_dir, &no_active_run())
-            .await
-            .unwrap();
+        let (found_run_dir, reports) =
+            emergency_rollback_impl(&sys, dir.path(), &runs_dir, &no_active_run())
+                .await
+                .unwrap();
+        assert_eq!(found_run_dir, run_dir);
         assert_eq!(reports.len(), 2);
     }
 
@@ -495,9 +639,11 @@ mod tests {
         std::fs::create_dir_all(&new_dir).unwrap();
         std::fs::write(new_dir.join("run.log"), "").unwrap(); // no journal -- must be skipped
 
-        let reports = emergency_rollback_impl(&sys, &runs_dir, &no_active_run())
-            .await
-            .unwrap();
+        let (found_run_dir, reports) =
+            emergency_rollback_impl(&sys, dir.path(), &runs_dir, &no_active_run())
+                .await
+                .unwrap();
+        assert_eq!(found_run_dir, old_dir);
         assert_eq!(
             reports.len(),
             1,
@@ -537,9 +683,11 @@ mod tests {
             return;
         }
 
-        let reports = emergency_rollback_impl(&sys, &runs_dir, &no_active_run())
-            .await
-            .unwrap();
+        let (found_run_dir, reports) =
+            emergency_rollback_impl(&sys, dir.path(), &runs_dir, &no_active_run())
+                .await
+                .unwrap();
+        assert_eq!(found_run_dir, old_dir);
         assert_eq!(
             reports.len(),
             1,
@@ -557,7 +705,7 @@ mod tests {
         std::fs::create_dir_all(&run_dir).unwrap();
         std::fs::write(run_dir.join("run.log"), "").unwrap();
 
-        let err = emergency_rollback_impl(&sys, &runs_dir, &no_active_run())
+        let err = emergency_rollback_impl(&sys, dir.path(), &runs_dir, &no_active_run())
             .await
             .unwrap_err();
         assert!(err.contains("no runs found to roll back"), "{err}");
@@ -574,7 +722,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runs_dir = dir.path().join("runs"); // never created
         assert!(
-            emergency_rollback_impl(&sys, &runs_dir, &no_active_run())
+            emergency_rollback_impl(&sys, dir.path(), &runs_dir, &no_active_run())
                 .await
                 .is_err()
         );
@@ -590,9 +738,11 @@ mod tests {
         let sys = MockController::new();
         let dir = tempfile::tempdir().unwrap();
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_toggle_tx, _shutdown_toggle_rx) = tokio::sync::watch::channel(false);
         let active_run = AsyncMutex::new(Some(ActiveRun {
             run_id: "r1".into(),
             control_tx,
+            shutdown_toggle_tx,
         }));
 
         let snapshot = voidframe_engine::store::RunState {
@@ -616,12 +766,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runs_dir = dir.path().join("runs"); // never created -- must not even be read
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_toggle_tx, _shutdown_toggle_rx) = tokio::sync::watch::channel(false);
         let active_run = AsyncMutex::new(Some(ActiveRun {
             run_id: "r1".into(),
             control_tx,
+            shutdown_toggle_tx,
         }));
 
-        let err = emergency_rollback_impl(&sys, &runs_dir, &active_run)
+        let err = emergency_rollback_impl(&sys, dir.path(), &runs_dir, &active_run)
             .await
             .unwrap_err();
         assert!(err.contains("currently active"), "{err}");
@@ -680,6 +832,17 @@ mod tests {
         ) -> voidframe_engine::error::Result<()> {
             tokio::time::sleep(self.delay).await;
             self.inner.write_powercfg(sub, setting, v, c).await
+        }
+        async fn find_cs2_video_config_path(
+            &self,
+        ) -> voidframe_engine::error::Result<std::path::PathBuf> {
+            self.inner.find_cs2_video_config_path().await
+        }
+        async fn read_cs2_video_config(&self) -> voidframe_engine::error::Result<String> {
+            self.inner.read_cs2_video_config().await
+        }
+        async fn write_cs2_video_config(&self, text: &str) -> voidframe_engine::error::Result<()> {
+            self.inner.write_cs2_video_config(text).await
         }
         async fn list_power_plans(
             &self,
@@ -795,8 +958,8 @@ mod tests {
         async fn kill_process_tree(&self, pid: u32) -> voidframe_engine::error::Result<()> {
             self.inner.kill_process_tree(pid).await
         }
-        async fn reissue_map(&self, map_command: &str) -> voidframe_engine::error::Result<()> {
-            self.inner.reissue_map(map_command).await
+        async fn send_console_command(&self, command: &str) -> voidframe_engine::error::Result<()> {
+            self.inner.send_console_command(command).await
         }
         async fn hide_console(&self) -> voidframe_engine::error::Result<()> {
             self.inner.hide_console().await
@@ -825,6 +988,56 @@ mod tests {
         {
             self.inner.read_hwinfo_sensors().await
         }
+        async fn reboot(
+            &self,
+            delay_secs: u32,
+            message: &str,
+        ) -> voidframe_engine::error::Result<()> {
+            self.inner.reboot(delay_secs, message).await
+        }
+        async fn shutdown(
+            &self,
+            delay_secs: u32,
+            message: &str,
+        ) -> voidframe_engine::error::Result<()> {
+            self.inner.shutdown(delay_secs, message).await
+        }
+        async fn cancel_shutdown(&self) -> voidframe_engine::error::Result<()> {
+            self.inner.cancel_shutdown().await
+        }
+        async fn register_task(
+            &self,
+            spec: &voidframe_engine::system::TaskSpec,
+        ) -> voidframe_engine::error::Result<()> {
+            self.inner.register_task(spec).await
+        }
+        async fn deregister_task(&self, name: &str) -> voidframe_engine::error::Result<()> {
+            self.inner.deregister_task(name).await
+        }
+        async fn task_exists(&self, name: &str) -> voidframe_engine::error::Result<bool> {
+            self.inner.task_exists(name).await
+        }
+        async fn run_script(
+            &self,
+            path: &std::path::Path,
+            timeout: std::time::Duration,
+        ) -> voidframe_engine::error::Result<voidframe_engine::system::ScriptOutput> {
+            self.inner.run_script(path, timeout).await
+        }
+        async fn boot_report(
+            &self,
+            since: std::time::SystemTime,
+        ) -> voidframe_engine::error::Result<voidframe_engine::system::BootReport> {
+            self.inner.boot_report(since).await
+        }
+        async fn bitlocker_protection(
+            &self,
+        ) -> voidframe_engine::error::Result<voidframe_engine::system::BitlockerStatus> {
+            self.inner.bitlocker_protection().await
+        }
+        async fn inhibit_sleep(&self, on: bool) -> voidframe_engine::error::Result<()> {
+            self.inner.inhibit_sleep(on).await
+        }
     }
 
     /// Builds a one-record Powercfg journal at `runs/r1/journal-s1.jsonl`
@@ -841,6 +1054,7 @@ mod tests {
                 setting: "IDLEDISABLE".into(),
                 value: 1,
             },
+            dir,
             mock,
             &mut journal,
             &voidframe_engine::system::MutationCtx {
@@ -848,6 +1062,9 @@ mod tests {
                 scenario_id: "s1".into(),
                 step_index: 0,
             },
+            // No live run here, so nothing observes this shield -- see
+            // `mutation::apply_module`'s own `no_return` doc.
+            &tokio::sync::watch::channel(false).0,
         )
         .await
         .unwrap();
@@ -952,11 +1169,11 @@ mod tests {
             delay,
         };
         let active_a = active_run.clone();
+        let data_root_a = dir.path().to_path_buf();
         let runs_dir_a = runs_dir.clone();
-        let task_a =
-            tokio::spawn(
-                async move { emergency_rollback_impl(&sys_a, &runs_dir_a, &active_a).await },
-            );
+        let task_a = tokio::spawn(async move {
+            emergency_rollback_impl(&sys_a, &data_root_a, &runs_dir_a, &active_a).await
+        });
 
         // Give task A time to pass the initial check and start its slow
         // `write_powercfg`, so task B genuinely arrives while A is in
@@ -968,12 +1185,12 @@ mod tests {
             delay,
         };
         let active_b = active_run.clone();
+        let data_root_b = dir.path().to_path_buf();
         let runs_dir_b = runs_dir.clone();
         let start = tokio::time::Instant::now();
-        let task_b =
-            tokio::spawn(
-                async move { emergency_rollback_impl(&sys_b, &runs_dir_b, &active_b).await },
-            );
+        let task_b = tokio::spawn(async move {
+            emergency_rollback_impl(&sys_b, &data_root_b, &runs_dir_b, &active_b).await
+        });
 
         let (result_a, result_b) = tokio::join!(task_a, task_b);
         let elapsed = start.elapsed();

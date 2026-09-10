@@ -5,6 +5,7 @@ import type { RunOutcome } from "../../App";
 
 const mockGetRunSnapshot = vi.fn();
 const mockSendControl = vi.fn();
+const mockSetShutdownWhenComplete = vi.fn();
 let engineEventHandler: ((e: EngineEvent) => void) | null = null;
 const mockSubscribeToEngineEvents = vi.fn((handler: (e: EngineEvent) => void) => {
   engineEventHandler = handler;
@@ -16,6 +17,7 @@ const mockSubscribeToEngineEvents = vi.fn((handler: (e: EngineEvent) => void) =>
 vi.mock("../../lib/api", () => ({
   getRunSnapshot: (...args: unknown[]) => mockGetRunSnapshot(...args),
   sendControl: (...args: unknown[]) => mockSendControl(...args),
+  setShutdownWhenComplete: (...args: unknown[]) => mockSetShutdownWhenComplete(...args),
   subscribeToEngineEvents: (handler: (e: EngineEvent) => void) => mockSubscribeToEngineEvents(handler),
 }));
 
@@ -59,8 +61,113 @@ describe("LiveMonitor", () => {
   beforeEach(() => {
     mockGetRunSnapshot.mockReset().mockResolvedValue(activeSnapshot);
     mockSendControl.mockReset().mockResolvedValue(undefined);
+    mockSetShutdownWhenComplete.mockReset().mockResolvedValue(undefined);
     mockSubscribeToEngineEvents.mockClear();
     engineEventHandler = null;
+  });
+
+  function progressWith(overrides: Partial<{ shutdown_when_complete: boolean }> = {}) {
+    return {
+      schema_version: "1.0.0" as const,
+      run_id: "r1",
+      project: sampleProject,
+      start_build_id: null,
+      start_launch_args: "",
+      start_launch_args_raw: "",
+      start_power_plan: { guid: "g", name: "Balanced", active: true },
+      thermal_baseline: null,
+      completed: [],
+      unstable: [],
+      cursor: { index: 0, stage: "apply" as const },
+      reboot: null,
+      shutdown_when_complete: false,
+      ...overrides,
+    };
+  }
+
+  it("renders the shutdown-when-complete checkbox checked/unchecked from progress.shutdown_when_complete", async () => {
+    const { rerender } = render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={progressWith({ shutdown_when_complete: false })}
+      />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    const checkbox = screen.getByRole("checkbox", { name: /shut down when the run completes/i });
+    expect(checkbox).not.toBeChecked();
+
+    rerender(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={progressWith({ shutdown_when_complete: true })}
+      />
+    );
+    expect(screen.getByRole("checkbox", { name: /shut down when the run completes/i })).toBeChecked();
+  });
+
+  it("defaults the shutdown-when-complete checkbox to unchecked when progress is null", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    expect(screen.getByRole("checkbox", { name: /shut down when the run completes/i })).not.toBeChecked();
+  });
+
+  it("calls setShutdownWhenComplete with the new value on toggle", async () => {
+    render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={progressWith({ shutdown_when_complete: false })}
+      />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("checkbox", { name: /shut down when the run completes/i }));
+    await waitFor(() => {
+      expect(mockSetShutdownWhenComplete).toHaveBeenCalledWith(true);
+    });
+  });
+
+  it("shows a thrown setShutdownWhenComplete error inline without crashing", async () => {
+    mockSetShutdownWhenComplete.mockRejectedValueOnce(new Error("Engine unreachable"));
+    render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={progressWith({ shutdown_when_complete: false })}
+      />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("checkbox", { name: /shut down when the run completes/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/engine unreachable/i)).toBeInTheDocument();
+    });
+  });
+
+  it("hides the shutdown-when-complete checkbox once the run is terminal, matching Pause/Abort's own hidden behavior", async () => {
+    render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={{ kind: "complete", runId: "r1" }}
+        onBackToBuilder={vi.fn()}
+        progress={progressWith({ shutdown_when_complete: false })}
+      />
+    );
+    await waitFor(() => {
+      expect(screen.getAllByText(/run complete/i).length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("checkbox", { name: /shut down when the run completes/i })).not.toBeInTheDocument();
   });
 
   it("shows an empty state and does not subscribe when there is no active run", async () => {
@@ -136,6 +243,32 @@ describe("LiveMonitor", () => {
     // existing events without new plumbing -- see PhaseChanged/LogLine).
     const heading = screen.getByRole("heading", { name: /collecting thermal baseline/i });
     expect(heading.querySelector(".animate-spin")).toBeInTheDocument();
+  });
+
+  it("renders the same spinner+progress treatment for the thermal_cooldown phase as thermal_baseline", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+
+    emit({ type: "PhaseChanged", phase: { kind: "thermal_cooldown" } });
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: /waiting for thermal cooldown/i })
+      ).toBeInTheDocument();
+    });
+    // Raw "Phase: thermal_cooldown" text must not also be shown -- same as
+    // thermal_baseline, the heading is fully replaced.
+    expect(screen.queryByText(/phase: thermal_cooldown/i)).not.toBeInTheDocument();
+
+    const heading = screen.getByRole("heading", { name: /waiting for thermal cooldown/i });
+    expect(heading.querySelector(".animate-spin")).toBeInTheDocument();
+
+    emit({ type: "ThermalProgress", sample: 5, total: 30, cpu_temp_celsius: 61.2, gpu_temp_celsius: null });
+    await waitFor(() => {
+      expect(heading).toHaveTextContent(/sample 5\/30/);
+      expect(heading).toHaveTextContent(/61\.2°C/);
+    });
   });
 
   it("regression: a live PhaseChanged event received before getRunSnapshot() resolves is not clobbered once the view becomes visible", async () => {
@@ -228,7 +361,10 @@ describe("LiveMonitor", () => {
     await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
 
     emit({ type: "RunComplete", run_id: "r1" });
-    expect(screen.queryByText(/run complete/i)).not.toBeInTheDocument();
+    // Anchored (not a bare /run complete/i substring match) so this doesn't
+    // also match the unrelated "Shut down when the run completes" checkbox
+    // label, which is always present while the run is live.
+    expect(screen.queryByText(/^run complete$/i)).not.toBeInTheDocument();
     expect(screen.getByText(/autonomous pipeline active/i)).toBeInTheDocument();
 
     // Simulates App.tsx's separate, app-lifetime subscription having
@@ -350,6 +486,243 @@ describe("LiveMonitor", () => {
     });
     fireEvent.click(screen.getByText(/view results/i));
     expect(onViewResults).toHaveBeenCalledWith("r1");
+  });
+
+  it("renders a human-readable heading for reboot_pending, with no raw phase text", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+
+    emit({ type: "PhaseChanged", phase: { kind: "reboot_pending", reason: "apply_next" } });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: /rebooting/i })).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/phase: reboot_pending/i)).not.toBeInTheDocument();
+  });
+
+  it("hides the entire control row (Pause/Resume, Abort, shutdown checkbox) during reboot_pending, since the engine has dropped its control channel and nothing in it can do anything -- then shows it again on boot_resume", async () => {
+    render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={progressWith({ shutdown_when_complete: false })}
+      />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+
+    // Baseline: a normal, non-terminal, non-reboot_pending phase shows the
+    // full control row.
+    emit({ type: "PhaseChanged", phase: { kind: "baseline" } });
+    await waitFor(() => {
+      expect(screen.getByText(/^pause$/i)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/abort & roll back/i)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /shut down when the run completes/i })).toBeInTheDocument();
+
+    // The engine's own execute() task has already returned and dropped its
+    // control-message/abort-signal receivers by this phase -- nothing is
+    // listening, so none of these controls can do anything meaningful.
+    emit({ type: "PhaseChanged", phase: { kind: "reboot_pending", reason: "apply_next" } });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: /rebooting/i })).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/^pause$/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^resume$/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/abort & roll back/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: /shut down when the run completes/i })
+    ).not.toBeInTheDocument();
+
+    // Once the machine has come back up and the engine has resumed, the
+    // controls are meaningful again -- this is scoped to reboot_pending
+    // specifically, not a permanent hide.
+    emit({ type: "PhaseChanged", phase: { kind: "boot_resume" } });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: /resumed after reboot/i })).toBeInTheDocument();
+    });
+    expect(screen.getByText(/^pause$/i)).toBeInTheDocument();
+    expect(screen.getByText(/abort & roll back/i)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /shut down when the run completes/i })).toBeInTheDocument();
+  });
+
+  it("renders a settling heading for boot_resume and a live countdown from the Post-boot settle log line", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+
+    emit({ type: "PhaseChanged", phase: { kind: "boot_resume" } });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: /resumed after reboot/i })).toBeInTheDocument();
+    });
+
+    emit({ type: "LogLine", text: "Post-boot settle: 150s remaining" });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: /resumed after reboot/i })).toHaveTextContent(
+        /150s/
+      );
+    });
+  });
+
+  it("shows a reboot-count chip computed from the project's own reboot-requiring scenarios", async () => {
+    const projectWithHags: Project = {
+      ...sampleProject,
+      scenarios: [
+        {
+          id: "hags",
+          name: "HAGS On",
+          description: "d",
+          enabled: true,
+          modules: [
+            {
+              type: "registry",
+              hive: "HKLM",
+              subkey: "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+              value_name: "HwSchMode",
+              value_type: "DWORD",
+              value: 2,
+              requires_reboot: true,
+            },
+          ],
+        },
+      ],
+    };
+    render(
+      <LiveMonitor project={projectWithHags} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    // countReboots([true]) === 2 (an apply-reboot then a final revert-reboot).
+    expect(screen.getByText(/2 reboots/i)).toBeInTheDocument();
+  });
+
+  it("renders progress.unstable scenarios with their recorded reason", async () => {
+    render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={{
+          schema_version: "1.0.0",
+          run_id: "r1",
+          project: sampleProject,
+          start_build_id: null,
+          start_launch_args: "",
+          start_launch_args_raw: "",
+          start_power_plan: { guid: "g", name: "Balanced", active: true },
+          thermal_baseline: null,
+          completed: [],
+          unstable: [{ scenario_id: "s1", reason: "bugcheck on resume" }],
+          cursor: { index: 0, stage: "apply" },
+          reboot: null,
+          shutdown_when_complete: false,
+        }}
+      />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    expect(screen.getByText(/s1/)).toBeInTheDocument();
+    expect(screen.getByText(/bugcheck on resume/i)).toBeInTheDocument();
+  });
+
+  it("shows the shutdown checkbox checked immediately after a successful toggle, before any progress exists", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} progress={null} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    const checkbox = screen.getByRole("checkbox", { name: /shut down when the run completes/i });
+    expect(checkbox).not.toBeChecked();
+    fireEvent.click(checkbox);
+    await waitFor(() => {
+      expect(mockSetShutdownWhenComplete).toHaveBeenCalledWith(true);
+    });
+    // Checked immediately, without progress ever having been updated.
+    expect(screen.getByRole("checkbox", { name: /shut down when the run completes/i })).toBeChecked();
+  });
+
+  it("seeds the shutdown checkbox from initialShutdownWhenComplete when no progress exists yet", async () => {
+    render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={null}
+        initialShutdownWhenComplete={true}
+      />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    expect(screen.getByRole("checkbox", { name: /shut down when the run completes/i })).toBeChecked();
+  });
+
+  it("reverts the checkbox when the toggle command fails", async () => {
+    mockSetShutdownWhenComplete.mockRejectedValueOnce(new Error("Engine unreachable"));
+    render(
+      <LiveMonitor
+        project={sampleProject}
+        runId="r1"
+        runOutcome={null}
+        onBackToBuilder={vi.fn()}
+        progress={progressWith({ shutdown_when_complete: false })}
+      />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    const checkbox = screen.getByRole("checkbox", { name: /shut down when the run completes/i });
+    fireEvent.click(checkbox);
+    await waitFor(() => {
+      expect(screen.getByText(/engine unreachable/i)).toBeInTheDocument();
+    });
+    expect(screen.getByRole("checkbox", { name: /shut down when the run completes/i })).not.toBeChecked();
+  });
+
+  it("switches the Abort button to Aborting… and disables it on click", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+    fireEvent.click(screen.getByText(/abort & roll back/i));
+    await waitFor(() => {
+      expect(mockSendControl).toHaveBeenCalledWith("Abort");
+    });
+    const abortButton = screen.getByText(/aborting…/i).closest("button");
+    expect(abortButton).not.toBeNull();
+    expect(abortButton).toBeDisabled();
+  });
+
+  it("hides the control row during the aborting phase", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+
+    emit({ type: "PhaseChanged", phase: { kind: "aborting" } });
+    await waitFor(() => {
+      expect(screen.getByText(/aborting — rolling back…/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/^pause$/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/abort & roll back/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/aborting…/i)).not.toBeInTheDocument();
+  });
+
+  it("renders the thermal countdown from ThermalProgress events", async () => {
+    render(
+      <LiveMonitor project={sampleProject} runId="r1" runOutcome={null} onBackToBuilder={vi.fn()} />
+    );
+    await waitFor(() => expect(mockSubscribeToEngineEvents).toHaveBeenCalled());
+
+    emit({ type: "PhaseChanged", phase: { kind: "thermal_baseline" } });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: /collecting thermal baseline/i })).toBeInTheDocument();
+    });
+
+    emit({ type: "ThermalProgress", sample: 12, total: 30, cpu_temp_celsius: 54.3, gpu_temp_celsius: null });
+    await waitFor(() => {
+      const heading = screen.getByRole("heading", { name: /collecting thermal baseline/i });
+      expect(heading).toHaveTextContent(/sample 12\/30/);
+      expect(heading).toHaveTextContent(/54\.3°C/);
+    });
   });
 
   it("does not show a View Results button when runOutcome is failed", async () => {

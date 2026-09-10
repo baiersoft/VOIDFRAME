@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::model::module::Hive;
 use crate::system::windows::registry;
 use crate::system::{AppManifest, RegKey, RegValue};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Advances past a quoted string starting at `text[open_quote]` (which must
 /// be `"`), honoring backslash-escaped characters inside it (so an escaped
@@ -255,18 +255,34 @@ pub fn write_launch_options(vdf_text: &str, app_id: u32, new_value: &str) -> Res
 /// Locates the local Steam installation via
 /// `HKCU\Software\Valve\Steam\SteamPath` (a `REG_SZ`, forward-slash-
 /// separated per Steam's own convention — normalized to backslashes here),
-/// falling back to the common install-path guesses if that registry value
-/// is absent.
+/// then the machine-wide `HKLM\SOFTWARE\WOW6432Node\Valve\Steam\InstallPath`
+/// the Steam installer writes, falling back to the common install-path
+/// guesses if both are absent.
+///
+/// The HKLM key matters for the deadman path (`voidframe.exe --recover`,
+/// spec §5.2): that runs as LocalSystem, whose `HKCU` is `HKU\.DEFAULT`
+/// and has no Steam key at all -- without a per-machine fallback, a Steam
+/// installed anywhere but the Program Files default made every
+/// `cs2_config` revert unreachable on exactly the path that exists for a
+/// machine nobody is logged into.
 pub(super) async fn find_steam_path() -> Result<PathBuf> {
-    let key = RegKey {
-        hive: Hive::Hkcu,
-        subkey: "Software\\Valve\\Steam".into(),
-        value_name: "SteamPath".into(),
-    };
-    if let RegValue::Sz(s) = registry::read(&key).await?
-        && !s.is_empty()
-    {
-        return Ok(PathBuf::from(s.replace('/', "\\")));
+    for key in [
+        RegKey {
+            hive: Hive::Hkcu,
+            subkey: "Software\\Valve\\Steam".into(),
+            value_name: "SteamPath".into(),
+        },
+        RegKey {
+            hive: Hive::Hklm,
+            subkey: "SOFTWARE\\WOW6432Node\\Valve\\Steam".into(),
+            value_name: "InstallPath".into(),
+        },
+    ] {
+        if let RegValue::Sz(s) = registry::read(&key).await?
+            && !s.is_empty()
+        {
+            return Ok(PathBuf::from(s.replace('/', "\\")));
+        }
     }
 
     for guess in [
@@ -286,7 +302,7 @@ pub(super) async fn find_steam_path() -> Result<PathBuf> {
     }
 
     Err(Error::msg(
-        "could not locate Steam installation via registry (HKCU\\Software\\Valve\\Steam\\SteamPath) or common install paths".into(),
+        "could not locate Steam installation via registry (HKCU\\Software\\Valve\\Steam\\SteamPath, HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam\\InstallPath) or common install paths".into(),
     ))
 }
 
@@ -402,34 +418,45 @@ pub(crate) fn parse_app_manifest(text: &str) -> Result<AppManifest> {
     })
 }
 
-/// Locates the currently-used account's `localconfig.vdf` under
-/// `<steam_path>\userdata\<accountID>\config\localconfig.vdf`. Enumerates
-/// every numeric `userdata\*` subdirectory that has a `config\localconfig.vdf`.
+/// Enumerates every numeric `userdata\*` account directory under
+/// `steam_path`, keeping only those for which `target` returns `Some` (an
+/// account is a candidate only if it actually has the file the caller cares
+/// about), and returns the account directory whose target FILE was most
+/// recently modified.
 ///
 /// If exactly one such account exists, uses it. If more than one does (a
-/// shared machine with multiple cached Steam accounts), uses the most-
-/// recently-modified `localconfig.vdf` — the actively-used account's file
-/// is the one Steam itself last wrote — and logs a warning. This is a
+/// shared machine with multiple cached Steam accounts), uses the account
+/// whose target file was most recently written — the actively-used
+/// account's file is the one Steam itself last wrote — and logs a warning.
+/// The file's mtime, deliberately not the account directory's: NTFS does
+/// not touch a directory's mtime when a file nested below it is rewritten,
+/// so ranking by the directory would pick whichever account last gained a
+/// direct child, not the one Steam is actually using. This is a
 /// heuristic, not a true "which account is logged in right now" check;
 /// M1 accepts the limitation since pre-flight already requires Steam
 /// running and logged in for any of this to matter, and a proper answer
 /// would mean parsing the sibling `config.vdf` for the active-account
 /// marker, which is more machinery than a hobby tool's M1 needs.
-pub async fn find_localconfig_path() -> Result<PathBuf> {
-    let steam_path = find_steam_path().await?;
+///
+/// Shared by `find_localconfig_path` (`config\localconfig.vdf`) and
+/// `find_cs2_video_config` (`730\local\cfg\cs2_video.txt`) so the account-
+/// resolution logic lives in exactly one place. Synchronous (`std::fs`)
+/// so it can be called from a plain, non-async function — async callers
+/// run it inside `tokio::task::spawn_blocking`.
+fn most_recently_modified_account_dir(
+    steam_path: &Path,
+    target: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<PathBuf> {
     let userdata_root = steam_path.join("userdata");
 
-    let mut entries = tokio::fs::read_dir(&userdata_root)
-        .await
+    let entries = std::fs::read_dir(&userdata_root)
         .map_err(|e| Error::msg(format!("reading {}: {e}", userdata_root.display())))?;
 
     let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| Error::msg(format!("reading {}: {e}", userdata_root.display())))?
-    {
-        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| Error::msg(format!("reading {}: {e}", userdata_root.display())))?;
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if !is_dir {
             continue;
         }
@@ -440,28 +467,67 @@ pub async fn find_localconfig_path() -> Result<PathBuf> {
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let vdf_path = entry.path().join("config").join("localconfig.vdf");
-        if let Ok(meta) = tokio::fs::metadata(&vdf_path).await {
-            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            candidates.push((vdf_path, modified));
-        }
+        let account_dir = entry.path();
+        let Some(target_file) = target(&account_dir) else {
+            continue;
+        };
+        let modified = std::fs::metadata(&target_file)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((account_dir, modified));
     }
 
     match candidates.len() {
         0 => Err(Error::msg(format!(
-            "no localconfig.vdf found under any account in {}",
+            "no matching Steam account directory found under {}",
             userdata_root.display()
         ))),
         1 => Ok(candidates.into_iter().next().unwrap().0),
         _ => {
             tracing::warn!(
-                "multiple Steam accounts found under {} — using the most-recently-modified localconfig.vdf",
+                "multiple Steam accounts found under {} — using the one whose target file was most recently modified",
                 userdata_root.display()
             );
             candidates.sort_by_key(|(_, modified)| *modified);
             Ok(candidates.pop().unwrap().0)
         }
     }
+}
+
+/// Locates the currently-used account's `localconfig.vdf` under
+/// `<steam_path>\userdata\<accountID>\config\localconfig.vdf`. See
+/// `most_recently_modified_account_dir` for the account-selection rule.
+pub async fn find_localconfig_path() -> Result<PathBuf> {
+    let steam_path = find_steam_path().await?;
+    tokio::task::spawn_blocking(move || {
+        let account_dir = most_recently_modified_account_dir(&steam_path, |acct| {
+            Some(acct.join("config").join("localconfig.vdf")).filter(|p| p.is_file())
+        })?;
+        Ok(account_dir.join("config").join("localconfig.vdf"))
+    })
+    .await
+    .map_err(|e| Error::msg(format!("userdata scan task panicked: {e}")))?
+}
+
+/// Locates the currently-used account's CS2 video config, the same way
+/// `find_localconfig_path` locates `localconfig.vdf` -- most-recently-
+/// modified `userdata/<accountID>/730/local/cfg/cs2_video.txt` (`730` is
+/// CS2's real Steam app id).
+pub fn find_cs2_video_config(steam_path: &Path) -> Result<PathBuf> {
+    let account_dir = most_recently_modified_account_dir(steam_path, |acct| {
+        Some(
+            acct.join("730")
+                .join("local")
+                .join("cfg")
+                .join("cs2_video.txt"),
+        )
+        .filter(|p| p.is_file())
+    })?;
+    Ok(account_dir
+        .join("730")
+        .join("local")
+        .join("cfg")
+        .join("cs2_video.txt"))
 }
 
 pub async fn read(app_id: u32) -> Result<String> {
@@ -680,5 +746,81 @@ mod tests {
             find_app_library_sync(vdf, "730"),
             Some(PathBuf::from(r"C:\Program Files (x86)\Steam"))
         );
+    }
+
+    // ---- find_cs2_video_config ---------------------------------------------
+
+    #[test]
+    fn find_cs2_video_config_resolves_under_the_active_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let account_dir = dir
+            .path()
+            .join("userdata")
+            .join("12345678")
+            .join("730")
+            .join("local")
+            .join("cfg");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(
+            account_dir.join("cs2_video.txt"),
+            "setting.defaultres 1920\n",
+        )
+        .unwrap();
+        // Matches find_localconfig_vdf's own "needs a config/localconfig.vdf
+        // under this account" discovery marker -- reuse the same userdata/*
+        // account directory this fixture already sets up for that function's
+        // own tests, if one exists in this file; otherwise this account
+        // directory alone (with a real cs2_video.txt) must be enough for
+        // find_cs2_video_config's own discovery logic to pick it.
+        let found = find_cs2_video_config(dir.path()).unwrap();
+        assert_eq!(found, account_dir.join("cs2_video.txt"));
+    }
+
+    /// Two cached accounts: the dormant one's directory was created (and so
+    /// modified) more recently, but the active one's target file was
+    /// rewritten more recently -- the FILE's mtime must decide, since a
+    /// nested rewrite never updates the account directory's own mtime.
+    #[test]
+    fn multiple_accounts_are_ranked_by_the_target_files_mtime_not_the_directorys() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = |acct: &str| {
+            dir.path()
+                .join("userdata")
+                .join(acct)
+                .join("730")
+                .join("local")
+                .join("cfg")
+        };
+        let write = |acct: &str| {
+            std::fs::create_dir_all(cfg(acct)).unwrap();
+            std::fs::write(
+                cfg(acct).join("cs2_video.txt"),
+                "setting.defaultres 1920
+",
+            )
+            .unwrap();
+        };
+        // Active account first, dormant account second: the dormant one's
+        // directory tree is the newer of the two.
+        write("22222222");
+        write("11111111");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cfg("11111111").join("cs2_video.txt"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // Steam rewrites the active account's file every session -- a
+        // nested rewrite, which leaves its account directory's mtime alone.
+        std::fs::write(
+            cfg("22222222").join("cs2_video.txt"),
+            "setting.defaultres 2560
+",
+        )
+        .unwrap();
+
+        let found = find_cs2_video_config(dir.path()).unwrap();
+        assert_eq!(found, cfg("22222222").join("cs2_video.txt"));
     }
 }

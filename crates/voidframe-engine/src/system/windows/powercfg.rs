@@ -8,6 +8,7 @@
 //! the same settings `/query` does plus the hidden ones, with an identical
 //! text format — there is no reason to ever use plain `/query`.
 
+use super::console_text::decode_console_output;
 use crate::error::{Error, Result};
 use crate::system::AcDc;
 use tokio::process::Command;
@@ -31,13 +32,10 @@ async fn run_powercfg(args: &[&str]) -> Result<String> {
         return Err(Error::msg(format!(
             "powercfg.exe {args:?} exited with {}: {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr)
+            decode_console_output(&output.stderr)
         )));
     }
-    // powercfg.exe writes plain ASCII/UTF-8-safe text on an English locale;
-    // from_utf8_lossy degrades gracefully on any other codepage rather than
-    // erroring the whole read.
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(decode_console_output(&output.stdout))
 }
 
 /// Parses the current AC / DC setting indices out of a `/qh` block. Both

@@ -1,7 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+
+const mockCancelShutdown = vi.fn();
+vi.mock("../../lib/api", () => ({
+  cancelShutdown: (...args: unknown[]) => mockCancelShutdown(...args),
+}));
+
 import { ResultsVisualizer } from "./ResultsVisualizer";
-import type { RunResults } from "../../lib/bindings";
+import type { Project, RunProgress, RunResults, RunSummary } from "../../lib/bindings";
 
 const sampleResults: RunResults = {
   schema_version: "1.0.0",
@@ -68,6 +74,7 @@ const sampleResults: RunResults = {
       verdict: "better",
     },
   ],
+  unstable: [],
 };
 
 describe("ResultsVisualizer", () => {
@@ -116,5 +123,166 @@ describe("ResultsVisualizer", () => {
     expect(screen.getAllByText(/0\.6%/).length).toBeGreaterThan(0);
     // mean_abs_animation_error_ms: 0.5 -> "0.5"
     expect(screen.getAllByText(/^0\.5$/).length).toBeGreaterThan(0);
+  });
+
+  const minimalProject: Project = {
+    schema_version: "1.0.0",
+    id: "p1",
+    name: "Test Project",
+    description: "d",
+    created_at: "2026-09-01T00:00:00Z",
+    settings: {},
+    baseline: { name: "Stock", description: "d" },
+    scenarios: [],
+  };
+
+  function progressFixture(overrides: Partial<RunProgress> = {}): RunProgress {
+    return {
+      schema_version: "1.0.0",
+      run_id: "r1",
+      project: minimalProject,
+      start_build_id: null,
+      start_launch_args: "",
+      start_launch_args_raw: "",
+      start_power_plan: { guid: "g", name: "Balanced", active: true },
+      thermal_baseline: null,
+      completed: [sampleResults.baseline, sampleResults.scenarios[0]],
+      unstable: [{ scenario_id: "s2", reason: "bugcheck on resume" }],
+      cursor: { index: 1, stage: "measure" },
+      reboot: null,
+      shutdown_when_complete: false,
+      ...overrides,
+    };
+  }
+
+  it("renders progress.completed with an 'Incomplete run' banner and the unstable list when results is null", () => {
+    render(<ResultsVisualizer results={null} progress={progressFixture()} />);
+    expect(screen.getByText(/incomplete run/i)).toBeInTheDocument();
+    expect(screen.getByText("Stock Baseline")).toBeInTheDocument();
+    expect(screen.getByText("Core Parking Disabled")).toBeInTheDocument();
+    expect(screen.getByText(/s2/)).toBeInTheDocument();
+    expect(screen.getByText(/bugcheck on resume/i)).toBeInTheDocument();
+  });
+
+  it("shows a finished run's own unstable list, not the current run's progress", () => {
+    render(
+      <ResultsVisualizer
+        results={{ ...sampleResults, unstable: [{ scenario_id: "s9", reason: "power loss" }] }}
+        progress={progressFixture()}
+      />
+    );
+    expect(screen.getByText(/power loss/i)).toBeInTheDocument();
+    expect(screen.queryByText(/bugcheck on resume/i)).not.toBeInTheDocument();
+  });
+
+  it("renders nothing meaningful (no crash) when both results and progress are absent", () => {
+    render(<ResultsVisualizer results={null} progress={null} />);
+    expect(screen.queryByText(/incomplete run/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a Cancel shutdown button when runOutcome is shutdown_requested, and calls cancelShutdown", async () => {
+    render(
+      <ResultsVisualizer results={sampleResults} runOutcome={{ kind: "shutdown_requested" }} />
+    );
+    fireEvent.click(screen.getByRole("button", { name: /cancel shutdown/i }));
+    await waitFor(() => {
+      expect(mockCancelShutdown).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("does not show a Cancel shutdown button when runOutcome is absent", () => {
+    render(<ResultsVisualizer results={sampleResults} />);
+    expect(screen.queryByRole("button", { name: /cancel shutdown/i })).not.toBeInTheDocument();
+  });
+
+  it("does not show a Winner banner when the top-ranked (or only) scenario is not actually Better than baseline", () => {
+    const worseResults: RunResults = structuredClone(sampleResults);
+    worseResults.scenarios[0].verdict = "worse";
+    worseResults.scenarios[0].wcps = -4.9;
+    render(<ResultsVisualizer results={worseResults} />);
+    expect(screen.queryByText(/Winner:/)).not.toBeInTheDocument();
+  });
+
+  it("still shows the Winner banner when the top-ranked scenario is genuinely Better", () => {
+    render(<ResultsVisualizer results={sampleResults} />);
+    expect(screen.getByText(/Winner: Core Parking Disabled/)).toBeInTheDocument();
+  });
+
+  it("picks the winner by Rust's rule (filter to better, then rank by wcps) -- not by ranking first", () => {
+    const mixedResults: RunResults = structuredClone(sampleResults);
+    // A second, non-baseline scenario with a HIGHER wcps than the existing
+    // genuinely-"better" one, but itself only "inconclusive" -- must not
+    // win just because it ranks first by raw wcps.
+    mixedResults.scenarios.push({
+      ...structuredClone(mixedResults.scenarios[0]),
+      scenario_id: "s2",
+      name: "Higher Score But Inconclusive",
+      wcps: 0.9,
+      verdict: "inconclusive",
+    });
+    mixedResults.scenarios[0].wcps = 0.4; // the genuinely "better" one, lower wcps
+    render(<ResultsVisualizer results={mixedResults} />);
+    expect(screen.getByText(/Winner: Core Parking Disabled/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Winner: Higher Score But Inconclusive/)
+    ).not.toBeInTheDocument();
+  });
+
+  const runHistory: RunSummary[] = [
+    {
+      run_id: "r1",
+      project_id: "p1",
+      completed_at: "2026-09-02T12:00:00Z",
+      scenario_count: 2,
+      winner_name: "Core Parking Disabled",
+      winner_wcps: 3.2,
+    },
+    {
+      run_id: "r0",
+      project_id: "p1",
+      completed_at: "2026-08-30T09:00:00Z",
+      scenario_count: 1,
+      winner_name: null,
+      winner_wcps: null,
+    },
+  ];
+
+  it("does not render a run-switcher when runHistory is omitted", () => {
+    render(<ResultsVisualizer results={sampleResults} />);
+    expect(screen.queryByRole("button", { name: /RUN r1/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/RUN r1/i)).toBeInTheDocument();
+  });
+
+  it("opens the run-switcher on click and lists every run in history", () => {
+    render(<ResultsVisualizer results={sampleResults} runHistory={runHistory} onSelectRun={vi.fn()} />);
+    expect(screen.queryByText(/Winner: Core Parking Disabled \(3\.2 WCPS\)/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /RUN r1/i }));
+    expect(screen.getByText(/Winner: Core Parking Disabled \(3\.2 WCPS\)/)).toBeInTheDocument();
+    expect(screen.getByText("1 scenario")).toBeInTheDocument();
+  });
+
+  it("switches to the clicked run and closes the dropdown", () => {
+    const onSelectRun = vi.fn();
+    render(<ResultsVisualizer results={sampleResults} runHistory={runHistory} onSelectRun={onSelectRun} />);
+    fireEvent.click(screen.getByRole("button", { name: /RUN r1/i }));
+    fireEvent.click(screen.getByText("1 scenario"));
+    expect(onSelectRun).toHaveBeenCalledWith("r0");
+    expect(screen.queryByText("1 scenario")).not.toBeInTheDocument();
+  });
+
+  it("does not call onSelectRun when the already-active run is clicked again", () => {
+    const onSelectRun = vi.fn();
+    render(<ResultsVisualizer results={sampleResults} runHistory={runHistory} onSelectRun={onSelectRun} />);
+    fireEvent.click(screen.getByRole("button", { name: /RUN r1/i }));
+    fireEvent.click(screen.getByText(/Winner: Core Parking Disabled \(3\.2 WCPS\)/));
+    expect(onSelectRun).not.toHaveBeenCalled();
+  });
+
+  it("closes the run-switcher on an outside click", () => {
+    render(<ResultsVisualizer results={sampleResults} runHistory={runHistory} onSelectRun={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /RUN r1/i }));
+    expect(screen.getByText("1 scenario")).toBeInTheDocument();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByText("1 scenario")).not.toBeInTheDocument();
   });
 });

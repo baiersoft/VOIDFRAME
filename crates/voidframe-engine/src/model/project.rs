@@ -39,6 +39,12 @@ pub struct Scenario {
     pub modules: Vec<Module>,
 }
 
+impl Scenario {
+    pub fn requires_reboot(&self) -> bool {
+        self.modules.iter().any(Module::requires_reboot)
+    }
+}
+
 /// A benchmark project: settings, a baseline, and 1..N scenarios.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
@@ -88,7 +94,7 @@ impl Project {
     /// persisted project, including an in-progress draft with no enabled
     /// scenarios yet -- see `validate()` for the additional "ready to run"
     /// check.
-    fn validate_structure(&self) -> Result<()> {
+    pub fn validate_structure(&self) -> Result<()> {
         self.settings.validate()?;
         for sc in &self.scenarios {
             // `Scenario.id` is user-authored (the project builder lets the
@@ -110,13 +116,17 @@ impl Project {
         Ok(())
     }
 
-    /// `validate_structure()`'s checks, plus: at least one enabled scenario.
-    /// This is the "ready to run" check — called by the `validate_scenario`
-    /// Tauri command before a matrix can launch, deliberately NOT by
-    /// `Project::load` (a work-in-progress draft with zero or all-disabled
-    /// scenarios must still be loadable and editable).
+    /// `validate_structure()`'s checks, plus: at least one enabled scenario,
+    /// and a capture window the chosen benchmark can actually fill
+    /// (`Settings::validate_capture_window`). This is the "ready to run"
+    /// check — called by the `validate_scenario` Tauri command before a
+    /// matrix can launch, deliberately NOT by `Project::load` (a
+    /// work-in-progress draft with zero or all-disabled scenarios, or an
+    /// older AveYo project saved with a since-tightened capture default,
+    /// must still be loadable and editable).
     pub fn validate(&self) -> Result<()> {
         self.validate_structure()?;
+        self.settings.validate_capture_window()?;
         if !self.scenarios.iter().any(|s| s.enabled) {
             return Err(Error::msg("project has no enabled scenarios".into()));
         }

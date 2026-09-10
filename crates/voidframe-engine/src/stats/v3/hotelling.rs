@@ -54,6 +54,16 @@ fn standardize<const P: usize>(
 ) -> (Vec<[f64; P]>, Vec<[f64; P]>) {
     let mu = column_means(baseline);
     let mut sigma = column_stddev(baseline, &mu);
+    // NOTE (2026-09-07, study/pamuk/ab-test-analysis-report.md §2.4): this
+    // floor has the same degenerate-baseline failure mode `stats::v3::score`
+    // used to have, but is deliberately NOT changed here -- in practice it
+    // self-normalizes (both baseline and scenario columns are scaled by the
+    // same floor, so a degenerate dimension's inflated variance mostly just
+    // down-weights that dimension in the pooled covariance rather than
+    // dominating T² the way an unbounded single z-score sum could), and
+    // `data/calibrated_thresholds_v3.json`'s whole threshold ladder was
+    // calibrated assuming this exact constant -- changing it would require
+    // re-deriving every entry in that table. Known limitation, not fixed.
     for s in &mut sigma {
         if s.abs() < 1e-9 {
             *s = 1e-9;

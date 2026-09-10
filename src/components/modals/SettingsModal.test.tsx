@@ -22,11 +22,10 @@ const baseConfig = {
   presentmon_path: "C:\\Program Files\\voidframe\\PresentMon\\PresentMon.exe",
   hwinfo_path: "C:\\Program Files\\voidframe\\HWiNFO64\\HWiNFO64.exe",
   thermal_cooldown_enabled: true,
-  default_warmup_loops: 2,
-  default_measure_loops: 3,
-  default_capture_seconds: 60,
   dry_run_default: false,
   last_known_cs2_build_id: null,
+  shutdown_when_complete_default: false,
+  post_boot_settle_seconds: 180,
 };
 
 describe("SettingsModal", () => {
@@ -54,18 +53,6 @@ describe("SettingsModal", () => {
     expect(screen.queryByText(/hwinfo executable path/i)).not.toBeInTheDocument();
   });
 
-  it("saves edited numeric defaults without a path field in the payload change", async () => {
-    await renderLoaded();
-    const warmup = screen.getByLabelText(/default warmup loops/i);
-    fireEvent.change(warmup, { target: { value: "4" } });
-    fireEvent.click(screen.getByRole("button", { name: /save preferences/i }));
-    await waitFor(() => {
-      expect(mockSaveConfig).toHaveBeenCalledWith(
-        expect.objectContaining({ default_warmup_loops: 4 })
-      );
-    });
-  });
-
   it("shows the backend's error on save failure", async () => {
     await renderLoaded();
     mockSaveConfig.mockRejectedValue(new Error("presentmon path could not be read"));
@@ -89,7 +76,7 @@ describe("SettingsModal", () => {
     await waitFor(() => {
       expect(screen.getByText(/processornamestring is absent/i)).toBeInTheDocument();
     });
-    expect(screen.getByLabelText(/default warmup loops/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/post-boot settle/i)).toBeInTheDocument();
   });
 
   it("still shows a successful GPU read when the CPU read fails, and vice versa", async () => {
@@ -106,6 +93,26 @@ describe("SettingsModal", () => {
     const toggle = screen.getByRole("checkbox", { name: /thermal cooldown between iterations/i });
     expect(toggle).toBeChecked();
     expect(screen.queryByText(/requires the hwinfo path above/i)).not.toBeInTheDocument();
+  });
+
+  it("round-trips the shutdown-when-complete default and post-boot settle seconds into saveConfig", async () => {
+    await renderLoaded({ shutdown_when_complete_default: false, post_boot_settle_seconds: 180 });
+    const shutdownToggle = screen.getByRole("checkbox", { name: /shut down when a run completes/i });
+    expect(shutdownToggle).not.toBeChecked();
+    fireEvent.click(shutdownToggle);
+
+    const settleInput = screen.getByLabelText(/post-boot settle/i);
+    fireEvent.change(settleInput, { target: { value: "240" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /save preferences/i }));
+    await waitFor(() => {
+      expect(mockSaveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          shutdown_when_complete_default: true,
+          post_boot_settle_seconds: 240,
+        })
+      );
+    });
   });
 
   it("shows HWiNFO's attribution link before PresentMon's, and opens the right URL", async () => {

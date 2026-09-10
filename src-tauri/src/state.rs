@@ -4,7 +4,7 @@
 //! (while a run is active) its `ControlMsg` sender.
 
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use voidframe_engine::model::Config;
 use voidframe_engine::paths::{DataRoot, InstanceLock, acquire_instance_lock};
 use voidframe_engine::run::ControlMsg;
@@ -24,6 +24,17 @@ pub struct ActiveRun {
     #[expect(dead_code)]
     pub run_id: String,
     pub control_tx: mpsc::Sender<ControlMsg>,
+    /// The live `shutdown_when_complete` toggle -- a separate, dedicated
+    /// channel from `control_tx`, deliberately never folded into
+    /// `ControlMsg` (see `voidframe_engine::run::execute::control`'s own
+    /// doc comment for why: `honor_pause`'s `try_recv()` silently discards
+    /// any message it doesn't recognize, which would risk a toggle sent
+    /// right at that checkpoint being lost). A `watch::Sender`, not an
+    /// `mpsc::Sender`: only the latest value ever matters, and
+    /// `watch::Sender::send` never blocks or errors on capacity, so a
+    /// reboot-heavy run that goes a long stretch between drain checkpoints
+    /// can never make `set_shutdown_when_complete` hang.
+    pub shutdown_toggle_tx: watch::Sender<bool>,
 }
 
 pub struct AppState {
@@ -32,6 +43,18 @@ pub struct AppState {
     pub sys: Arc<dyn SystemController>,
     pub store: StoreHandle,
     pub active_run: AsyncMutex<Option<ActiveRun>>,
+    /// Whether this process was launched via `--resume` (spec §3.4) --
+    /// known synchronously at process launch (`cli_modes::parse` in
+    /// `lib.rs`, well before `.setup()` runs), not tied to whether
+    /// `resume_run_impl`'s own background task has actually finished (or
+    /// even started) resuming that run. The frontend reads this at mount
+    /// via `is_resume_launch` to tell "the backend is actively and
+    /// correctly resuming this exact run right now" apart from "a previous
+    /// run crashed" -- tying it to `resume_run_impl`'s completion instead
+    /// would reintroduce that exact race, since a resume can take a while
+    /// (e.g. it calls `settle_wait`) and the frontend's mount effect can
+    /// easily run first.
+    pub resume_launch: bool,
     /// Held for `AppState`'s entire lifetime (i.e. the whole app run, since
     /// `AppState` is handed to `.manage()` in `lib.rs` and only dropped on
     /// process exit). Never read after construction — its sole purpose is
@@ -60,12 +83,20 @@ impl AppState {
     /// like the automation plugin: this only changes *where* files are read
     /// and written, exposes no new surface, and is equally useful for a
     /// developer manually testing against disposable state.
-    pub fn new() -> anyhow::Result<Self> {
+    ///
+    /// `resume_launch`: `lib.rs`'s own `resume_on_start` (`cli_mode ==
+    /// CliMode::Resume`), passed straight through into
+    /// [`AppState::resume_launch`] -- see that field's own doc comment for
+    /// why the frontend needs it exposed synchronously rather than derived
+    /// from `resume_run_impl`'s completion.
+    pub fn new(resume_launch: bool) -> anyhow::Result<Self> {
         let data_root = match std::env::var_os("VOIDFRAME_DATA_ROOT") {
             Some(path) => DataRoot::with_base(std::path::PathBuf::from(path))?,
             None => DataRoot::resolve(false)?,
         };
-        Self::with_data_root(data_root)
+        let mut state = Self::with_data_root(data_root)?;
+        state.resume_launch = resume_launch;
+        Ok(state)
     }
 
     /// The real constructor, split out from [`AppState::new`] so tests can
@@ -97,6 +128,13 @@ impl AppState {
             sys: Arc::new(WindowsController::new()),
             store,
             active_run: AsyncMutex::new(None),
+            // Not a parameter here: every other caller of `with_data_root`
+            // (this file's and `commands/run.rs`'s own tests) is not
+            // simulating a `--resume` launch, so `false` is the correct
+            // default for all of them. `AppState::new` -- the one real
+            // caller that needs a non-default value -- overwrites it right
+            // after this call returns.
+            resume_launch: false,
             instance_lock,
         })
     }

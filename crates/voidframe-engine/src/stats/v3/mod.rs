@@ -14,7 +14,9 @@ mod verdict;
 pub use hotelling::hotelling_t2_statistic;
 pub use linalg::spd_inverse;
 pub use metrics::{adaptive_frame_time_cv, mean_abs_animation_error_ms, stutter_count_pct};
-pub use score::{WcpsV3Weights, compute_wcps_v3};
-pub use thresholds::{CALIBRATED_N_LADDER, CalibratedThresholds, load_calibrated_thresholds};
+pub use score::{WcpsV3Weights, any_metric_baseline_degenerate, compute_wcps_v3};
+pub use thresholds::{
+    CALIBRATED_N_LADDER, CalibratedThresholds, Margin, load_calibrated_thresholds,
+};
 pub use tost::{TostResult, tost_evaluate};
 pub use verdict::evaluate_verdict;

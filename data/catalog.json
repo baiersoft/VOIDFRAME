@@ -54,5 +54,89 @@
     "available_in": "M1",
     "singleton": true,
     "module_template": {"type": "launch_args", "args": ""}
+  },
+  {
+    "id": "hags",
+    "name": "Hardware-Accelerated GPU Scheduling (HAGS)",
+    "category": "gpu",
+    "kind": "registry",
+    "description": "Turns Windows' hardware-accelerated GPU scheduling on (HwSchMode = 2). Requires a reboot to take effect; the scenario reboots automatically and VOIDFRAME resumes after logon. Toggle it off by setting 1.",
+    "available_in": "M3",
+    "off_value": 1,
+    "module_template": {
+      "type": "registry",
+      "hive": "HKLM",
+      "subkey": "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+      "value_name": "HwSchMode",
+      "value_type": "DWORD",
+      "value": 2,
+      "requires_reboot": true
+    }
+  },
+  {
+    "id": "game-mode",
+    "name": "Windows Game Mode",
+    "category": "advanced",
+    "kind": "registry",
+    "description": "Turns Windows' Game Mode on (AutoGameModeEnabled = 1). Takes effect immediately, no reboot needed. Toggle it off by setting 0.",
+    "available_in": "M3",
+    "off_value": 0,
+    "module_template": {
+      "type": "registry",
+      "hive": "HKCU",
+      "subkey": "SOFTWARE\\Microsoft\\GameBar",
+      "value_name": "AutoGameModeEnabled",
+      "value_type": "DWORD",
+      "value": 1
+    }
+  },
+  {
+    "id": "win32-priority-separation",
+    "name": "Win32PrioritySeparation",
+    "category": "cpu",
+    "kind": "registry",
+    "description": "Sets the thread-scheduling quantum/interval/foreground-boost combination Windows uses (Win32PrioritySeparation). Applies immediately -- no reboot needed, same as changing it from sysdm.cpl. Pick the value that isn't already your machine's current one.",
+    "available_in": "M3",
+    "module_template": {
+      "type": "registry",
+      "hive": "HKLM",
+      "subkey": "SYSTEM\\CurrentControlSet\\Control\\PriorityControl",
+      "value_name": "Win32PrioritySeparation",
+      "value_type": "DWORD",
+      "value": 2
+    },
+    "value_choices": [
+      {"label": "20 (0x14) — Long / Variable / PsPrioSep 0", "value": 20},
+      {"label": "21 (0x15) — Long / Variable / PsPrioSep 1", "value": 21},
+      {"label": "22 (0x16) — Long / Variable / PsPrioSep 2", "value": 22},
+      {"label": "24 (0x18) — Long / Fixed / PsPrioSep 0", "value": 24},
+      {"label": "25 (0x19) — Long / Fixed / PsPrioSep 1", "value": 25},
+      {"label": "26 (0x1A) — Long / Fixed / PsPrioSep 2", "value": 26},
+      {"label": "36 (0x24) — Short / Variable / PsPrioSep 0", "value": 36},
+      {"label": "37 (0x25) — Short / Variable / PsPrioSep 1", "value": 37},
+      {"label": "38 (0x26) — Short / Variable / PsPrioSep 2", "value": 38},
+      {"label": "40 (0x28) — Short / Fixed / PsPrioSep 0", "value": 40},
+      {"label": "41 (0x29) — Short / Fixed / PsPrioSep 1", "value": 41},
+      {"label": "42 (0x2A) — Short / Fixed / PsPrioSep 2", "value": 42}
+    ]
+  },
+  {
+    "id": "cs2-config",
+    "name": "CS2 Video Config",
+    "category": "cs2_launch",
+    "kind": "cs2_config",
+    "description": "Edits CS2's video settings (cs2_video.txt) for this scenario -- shadow/texture/particle quality, MSAA, FSR, HDR, and more. The pristine file is snapshotted and restored on revert.",
+    "available_in": "M3",
+    "singleton": true,
+    "module_template": {"type": "cs2_config", "settings": {}}
+  },
+  {
+    "id": "custom-script",
+    "name": "Custom Script",
+    "category": "advanced",
+    "kind": "custom_script",
+    "description": "Runs your own apply/revert .bat/.cmd/.ps1 scripts for this scenario. VOIDFRAME hashes and runs your revert script but cannot verify what it actually did -- results from a scenario using this are marked 'script-reverted, unverified'.",
+    "available_in": "M3",
+    "module_template": {"type": "custom_script", "apply_script": "", "revert_script": "", "requires_reboot": false, "description": ""}
   }
 ]

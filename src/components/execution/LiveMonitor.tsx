@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Pause, Play, Square, Terminal, Activity, CheckCircle2, XCircle, ShieldAlert, RefreshCw } from "lucide-react";
-import { getRunSnapshot, sendControl, subscribeToEngineEvents } from "../../lib/api";
-import type { EngineEvent, Phase, Project } from "../../lib/bindings";
-import { phaseLabel, phaseScenarioId } from "../../lib/phase";
+import { getRunSnapshot, sendControl, setShutdownWhenComplete, subscribeToEngineEvents } from "../../lib/api";
+import type { EngineEvent, Phase, Project, RunProgress } from "../../lib/bindings";
+import { canOperatorControl, phaseLabel, phaseScenarioId } from "../../lib/phase";
+import { countReboots, scenarioRequiresReboot } from "../../lib/reboots";
 import type { RunOutcome } from "../../App";
 
 interface LiveMonitorProps {
@@ -16,6 +17,45 @@ interface LiveMonitorProps {
   runOutcome: RunOutcome | null;
   onBackToBuilder: () => void;
   onViewResults?: (runId: string) => void;
+  /** Fetched by App.tsx (`getRunProgress`) when a run becomes active and on
+   * every `PhaseChanged`/`ScenarioComplete` it already handles -- this
+   * component does no polling of its own, only renders what it's given. */
+  progress?: RunProgress | null;
+  /** The value the run was started with (the countdown modal's choice) --
+   * seeds the checkbox until the first `progress.json` exists (the engine
+   * only writes it after the thermal baseline). */
+  initialShutdownWhenComplete?: boolean;
+}
+
+/** Matches the engine's own `Post-boot settle: {n}s remaining` log line
+ * (emitted every 30s during the settle wait, spec D5) to drive the
+ * boot_resume countdown below. */
+const SETTLE_LOG_PATTERN = /^Post-boot settle: (\d+)s remaining$/;
+
+/** Human-readable heading text for the two M3 reboot phases -- mirrors the
+ * `thermal_baseline` special case just below it: `phaseLabel` itself stays
+ * a literal mirror of the engine's `Display` impl (`reboot_pending:apply_next`
+ * etc, asserted in `phase.test.ts`), so the human-friendly text lives here
+ * instead of replacing that contract. */
+function rebootHeading(phase: Phase): string | null {
+  if (phase.kind === "reboot_pending") {
+    switch (phase.reason) {
+      case "apply_next":
+        return "Rebooting to apply the next scenario…";
+      case "revert_only":
+        return "Rebooting to revert…";
+      case "revert_and_apply_next":
+        return "Rebooting to revert and apply the next scenario…";
+      default: {
+        const _exhaustive: never = phase.reason;
+        return _exhaustive;
+      }
+    }
+  }
+  if (phase.kind === "boot_resume") {
+    return "Resumed after reboot — settling…";
+  }
+  return null;
 }
 
 interface LogLine {
@@ -41,6 +81,8 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
   runOutcome,
   onBackToBuilder,
   onViewResults,
+  progress = null,
+  initialShutdownWhenComplete = false,
 }) => {
   const [hasActiveRun, setHasActiveRun] = useState<boolean | null>(null); // null = still checking
   const [phase, setPhase] = useState<Phase | null>(null);
@@ -48,12 +90,38 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
   const [completedScenarios, setCompletedScenarios] = useState<string[]>([]);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
   const [operatorPrompt, setOperatorPrompt] = useState<string | null>(null);
+  // Parsed from the engine's own `Post-boot settle: {n}s remaining` log
+  // line (emitted every 30s during `boot_resume`) -- no separate event/poll
+  // exists for this, so the log stream is the source of truth.
+  const [settleSecondsRemaining, setSettleSecondsRemaining] = useState<number | null>(null);
+  const rebootCount = countReboots(
+    (project.scenarios ?? []).filter((s) => s.enabled ?? true).map(scenarioRequiresReboot)
+  );
   // Local-only optimistic flag: the engine only honours Pause between
   // iterations and never emits a distinct "paused" confirmation event, so
   // this reflects "the user asked to pause", not a backend-confirmed state.
   const [pauseRequested, setPauseRequested] = useState(false);
+  // Local-only optimistic flags -- same reasoning as pauseRequested above.
+  const [abortRequested, setAbortRequested] = useState(false);
+  // The last shutdown-toggle value the user successfully sent this mount;
+  // null = nothing sent yet, fall through to progress/initial. Safe to be
+  // optimistic: the backend channel is a watch (latest value wins, the send
+  // never blocks) -- see set_shutdown_when_complete in commands/run.rs.
+  const [shutdownChecked, setShutdownChecked] = useState<boolean | null>(null);
+  const [thermalProgress, setThermalProgress] = useState<{
+    sample: number;
+    total: number;
+    cpuTempCelsius: number | null;
+  } | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
   const [isSendingControl, setIsSendingControl] = useState(false);
+  // Own loading/error state, independent of isSendingControl/controlError
+  // above -- those are scoped to ControlMsg actions (Pause/Resume/Abort/
+  // OperatorAcknowledged) specifically, and mixing this in would spuriously
+  // disable the Pause/Abort buttons while the checkbox is mid-toggle (or
+  // vice versa).
+  const [isSendingShutdownToggle, setIsSendingShutdownToggle] = useState(false);
+  const [shutdownToggleError, setShutdownToggleError] = useState<string | null>(null);
 
   const pushLog = (text: string) => {
     setLogLines((prev) => {
@@ -101,7 +169,11 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
     setLogLines([]);
     setOperatorPrompt(null);
     setPauseRequested(false);
+    setAbortRequested(false);
+    setShutdownChecked(null);
+    setThermalProgress(null);
     setControlError(null);
+    setSettleSecondsRemaining(null);
 
     // Subscribes to live engine events, idempotently. Called synchronously
     // below when runId is already known to be active, and also from the
@@ -119,11 +191,16 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
           setPhase(event.phase);
           const sc = phaseScenarioId(event.phase);
           if (sc !== null) setCurrentScenario(sc);
+          // A stale countdown must not survive into the next phase.
+          setThermalProgress(null);
           break;
         }
-        case "LogLine":
+        case "LogLine": {
           pushLog(event.text);
+          const settleMatch = SETTLE_LOG_PATTERN.exec(event.text);
+          if (settleMatch) setSettleSecondsRemaining(Number(settleMatch[1]));
           break;
+        }
         case "IterationStarted":
           pushLog(`[${event.kind}] iteration ${event.index} started`);
           break;
@@ -148,6 +225,11 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
           setCompletedScenarios((prev) => [...prev, event.result.scenario_id]);
           pushLog(`Scenario "${event.result.name}" complete`);
           break;
+        case "ScenarioScored":
+          pushLog(
+            `Scenario "${event.result.name}" scored: wcps=${event.result.wcps?.toFixed(2) ?? "?"} verdict=${event.result.verdict}`
+          );
+          break;
         case "OperatorPrompt":
           setOperatorPrompt(event.text);
           break;
@@ -161,6 +243,13 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
           break;
         case "RollbackProgress":
           pushLog(`Rolling back — ${event.reverted} mutation(s) reverted so far`);
+          break;
+        case "ThermalProgress":
+          setThermalProgress({
+            sample: event.sample,
+            total: event.total,
+            cpuTempCelsius: event.cpu_temp_celsius,
+          });
           break;
         default: {
           const _exhaustive: never = event;
@@ -234,12 +323,14 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
   };
 
   const handleAbort = async () => {
-    if (isSendingControl) return;
+    if (isSendingControl || abortRequested) return;
     setControlError(null);
+    setAbortRequested(true);
     setIsSendingControl(true);
     try {
       await sendControl("Abort");
     } catch (e) {
+      setAbortRequested(false);
       setControlError(e instanceof Error ? e.message : String(e));
     } finally {
       setIsSendingControl(false);
@@ -257,6 +348,21 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
       setControlError(e instanceof Error ? e.message : String(e));
     } finally {
       setIsSendingControl(false);
+    }
+  };
+
+  const handleShutdownToggle = async (checked: boolean) => {
+    if (isSendingShutdownToggle) return;
+    setShutdownToggleError(null);
+    setShutdownChecked(checked);
+    setIsSendingShutdownToggle(true);
+    try {
+      await setShutdownWhenComplete(checked);
+    } catch (e) {
+      setShutdownChecked(!checked);
+      setShutdownToggleError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsSendingShutdownToggle(false);
     }
   };
 
@@ -279,6 +385,16 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
     );
   }
 
+  // Both thermal phases sample HWiNFO the same way (the same ThermalProgress
+  // events drive `thermalProgress` below) -- only the heading text differs,
+  // so they share one spinner+readout render branch.
+  const thermalStatusLabel =
+    phase?.kind === "thermal_baseline"
+      ? "Collecting thermal baseline…"
+      : phase?.kind === "thermal_cooldown"
+        ? "Waiting for thermal cooldown…"
+        : null;
+
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-8 w-full">
       <div className="glass-panel p-6 rounded-2xl space-y-4">
@@ -298,12 +414,40 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
               <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-white/5 text-white/60 border border-white/10">
                 Project: {project.name}
               </span>
+              {rebootCount > 0 && (
+                <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                  {rebootCount} reboot{rebootCount === 1 ? "" : "s"}
+                </span>
+              )}
             </div>
             <h2 className="font-sans font-bold text-2xl text-white flex items-center gap-2">
-              {phase?.kind === "thermal_baseline" ? (
+              {phase?.kind === "aborting" ? (
                 <>
                   <RefreshCw className="w-5 h-5 animate-spin" aria-hidden="true" />
-                  <span>Collecting thermal baseline…</span>
+                  <span>Aborting — rolling back…</span>
+                </>
+              ) : thermalStatusLabel ? (
+                <>
+                  <RefreshCw className="w-5 h-5 animate-spin" aria-hidden="true" />
+                  <span>{thermalStatusLabel}</span>
+                  {thermalProgress && (
+                    <span className="text-sm font-normal text-white/50">
+                      (sample {thermalProgress.sample}/{thermalProgress.total}
+                      {thermalProgress.cpuTempCelsius !== null &&
+                        `, ${thermalProgress.cpuTempCelsius.toFixed(1)}°C`}
+                      )
+                    </span>
+                  )}
+                </>
+              ) : phase && rebootHeading(phase) !== null ? (
+                <>
+                  <RefreshCw className="w-5 h-5 animate-spin" aria-hidden="true" />
+                  <span>{rebootHeading(phase)}</span>
+                  {phase.kind === "boot_resume" && settleSecondsRemaining !== null && (
+                    <span className="text-sm font-normal text-white/50">
+                      ({settleSecondsRemaining}s remaining)
+                    </span>
+                  )}
                 </>
               ) : (
                 <span>Phase: {phase ? phaseLabel(phase) : "starting…"}</span>
@@ -315,35 +459,55 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
             </p>
           </div>
 
-          {!terminal && (
-            <div className="flex items-center gap-3">
-              {pauseRequested ? (
+          {!terminal && canOperatorControl(phase) && (
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-3">
+                {pauseRequested ? (
+                  <button
+                    onClick={handleResume}
+                    disabled={isSendingControl}
+                    className="glass-pill px-4 py-2 rounded-xl text-xs font-mono text-white/80 hover:text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Play className="w-4 h-4" />
+                    <span>Resume</span>
+                  </button>
+                ) : (
+                  <button
+                    onClick={handlePause}
+                    disabled={isSendingControl}
+                    className="glass-pill px-4 py-2 rounded-xl text-xs font-mono text-white/80 hover:text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Pause className="w-4 h-4" />
+                    <span>Pause</span>
+                  </button>
+                )}
                 <button
-                  onClick={handleResume}
-                  disabled={isSendingControl}
-                  className="glass-pill px-4 py-2 rounded-xl text-xs font-mono text-white/80 hover:text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  onClick={handleAbort}
+                  disabled={isSendingControl || abortRequested}
+                  className="px-4 py-2 rounded-xl bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 text-xs font-mono font-semibold flex items-center gap-2 cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <Play className="w-4 h-4" />
-                  <span>Resume</span>
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  <span>{abortRequested ? "Aborting…" : "Abort & Roll Back"}</span>
                 </button>
-              ) : (
-                <button
-                  onClick={handlePause}
-                  disabled={isSendingControl}
-                  className="glass-pill px-4 py-2 rounded-xl text-xs font-mono text-white/80 hover:text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <Pause className="w-4 h-4" />
-                  <span>Pause</span>
-                </button>
+              </div>
+              {pauseRequested && !abortRequested && (
+                <p className="text-[10px] font-mono text-white/40">
+                  Pause requested — pausing at the next safe point…
+                </p>
               )}
-              <button
-                onClick={handleAbort}
-                disabled={isSendingControl}
-                className="px-4 py-2 rounded-xl bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 text-xs font-mono font-semibold flex items-center gap-2 cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              <label
+                className={`glass-pill px-4 py-2 rounded-xl text-xs font-mono text-white/80 flex items-center gap-2 w-fit ${isSendingShutdownToggle ? "opacity-70" : "cursor-pointer"}`}
               >
-                <Square className="w-3.5 h-3.5 fill-current" />
-                <span>Abort &amp; Roll Back</span>
-              </button>
+                <input
+                  type="checkbox"
+                  checked={shutdownChecked ?? progress?.shutdown_when_complete ?? initialShutdownWhenComplete}
+                  disabled={isSendingShutdownToggle}
+                  onChange={(e) => handleShutdownToggle(e.target.checked)}
+                  className="rounded bg-black/50 border-white/20 text-[#06b6d4] focus:ring-0 w-4 h-4 cursor-pointer disabled:cursor-not-allowed"
+                />
+                <span>Shut down when the run completes</span>
+                {isSendingShutdownToggle && <RefreshCw className="w-3 h-3 animate-spin" aria-hidden="true" />}
+              </label>
             </div>
           )}
         </div>
@@ -352,9 +516,14 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
             {controlError}
           </div>
         )}
+        {shutdownToggleError && (
+          <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs font-mono">
+            {shutdownToggleError}
+          </div>
+        )}
       </div>
 
-      {operatorPrompt && (
+      {operatorPrompt && canOperatorControl(phase) && (
         <div className="glass-panel p-6 rounded-2xl border-amber-500/30 space-y-3">
           <div className="flex items-center gap-2 text-amber-300 font-mono text-xs font-bold uppercase">
             <ShieldAlert className="w-4 h-4" /> Operator Action Required
@@ -367,6 +536,21 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
           >
             Acknowledge
           </button>
+        </div>
+      )}
+
+      {progress && progress.unstable.length > 0 && (
+        <div className="glass-panel p-6 rounded-2xl border-amber-500/30 space-y-3">
+          <div className="flex items-center gap-2 text-amber-300 font-mono text-xs font-bold uppercase">
+            <ShieldAlert className="w-4 h-4" /> Unstable Scenarios
+          </div>
+          <ul className="space-y-1.5">
+            {progress.unstable.map((u) => (
+              <li key={u.scenario_id} className="text-xs font-mono text-white/70">
+                <span className="text-white font-semibold">{u.scenario_id}</span>: {u.reason}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

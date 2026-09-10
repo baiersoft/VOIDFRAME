@@ -4,6 +4,7 @@
 //! ` *` on the active one. The label is localized by Windows (`Power Scheme
 //! GUID:` / `GUID des Energieschemas:` / …), so parsing keys on the GUID.
 
+use super::console_text::decode_console_output;
 use crate::error::{Error, Result};
 use crate::system::PowerPlan;
 use tokio::process::Command;
@@ -25,10 +26,10 @@ async fn run_powercfg(args: &[&str]) -> Result<String> {
         return Err(Error::msg(format!(
             "powercfg.exe {args:?} exited with {}: {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr)
+            decode_console_output(&output.stderr)
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(decode_console_output(&output.stdout))
 }
 
 /// `true` for the `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` shape powercfg

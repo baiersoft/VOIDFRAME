@@ -11,8 +11,7 @@
 
 use crate::capture::runner::CaptureRunner;
 use crate::error::Result;
-use crate::model::results::RunResults;
-use crate::run::execute::{RunConfig, execute};
+use crate::run::execute::{RunOutcome, RunStart, execute};
 use crate::run::run_log::RunLog;
 use crate::run::{ControlMsg, EngineEvent};
 use crate::system::SystemController;
@@ -23,7 +22,7 @@ use tokio::task::JoinHandle;
 
 pub struct RunHandle {
     pub events: mpsc::Receiver<EngineEvent>,
-    pub join: JoinHandle<Result<RunResults>>,
+    pub join: JoinHandle<Result<RunOutcome>>,
 }
 
 /// Forwards every `ControlMsg` from the caller's raw `control` channel to
@@ -69,18 +68,23 @@ async fn tee_control_for_abort(
 pub fn spawn_run(
     sys: Arc<dyn SystemController>,
     capture: Arc<dyn CaptureRunner>,
-    config: RunConfig,
+    start: RunStart,
     control: mpsc::Receiver<ControlMsg>,
+    shutdown_toggle: watch::Receiver<bool>,
 ) -> RunHandle {
     let (events_tx, mut events_rx) = mpsc::channel::<EngineEvent>(64);
     let (abort_tx, abort_rx) = watch::channel(false);
     let (inner_control_tx, inner_control_rx) = mpsc::channel::<ControlMsg>(16);
     tokio::spawn(tee_control_for_abort(control, inner_control_tx, abort_tx));
 
-    // Captured before `config` is moved into `execute()` below -- this is
+    // Captured before `start` is moved into `execute()` below -- this is
     // the only information `run_dir_to_prune_on_abort` needs, and
-    // `execute()` consumes its `RunConfig` by value.
-    let run_dir = config.data_root.join("runs").join(config.run_id.clone());
+    // `execute()` consumes its `RunStart` by value.
+    let run_dir = start
+        .config()
+        .data_root
+        .join("runs")
+        .join(start.config().run_id.clone());
 
     // Tee every event through this run's own on-disk narrative log
     // (`RunLog`) before forwarding it on unchanged. `events_rx` above is
@@ -90,7 +94,7 @@ pub fn spawn_run(
     // through it, so this is the one place a per-run log file can be
     // written once for both callers instead of each shell doing it itself.
     let (public_tx, public_rx) = mpsc::channel::<EngineEvent>(64);
-    let run_log = RunLog::new(&config.data_root, &config.run_id);
+    let run_log = RunLog::new(&start.config().data_root, &start.config().run_id);
     tokio::spawn(async move {
         // Once the caller drops its `events` receiver, `public_tx.send`
         // starts failing -- but the run itself keeps going, and every event
@@ -110,10 +114,11 @@ pub fn spawn_run(
         let result = execute(
             sys,
             capture,
-            config,
+            start,
             events_tx.clone(),
             inner_control_rx,
             abort_rx,
+            shutdown_toggle,
         )
         .await;
         if let Err(e) = &result {
@@ -136,17 +141,25 @@ pub fn spawn_run(
 
 /// Deletes only this run's forensic-value-free files after a genuine
 /// operator Abort: every `scenario-*` directory (partial capture CSVs) and
-/// `thermal.json`. Leaves `journal-*.jsonl` and `run.log` in place --
-/// unlike a `results.json` (an aborted run never produces one, since
-/// `execute()`'s `body` returns `Err` before REPORT), a scenario's journal
-/// is the only record that lets `rollback_now`/`emergency_rollback` repair
-/// the machine afterward, and the revert that ran alongside this Abort may
-/// itself have failed (see `run_scenario`'s and `execute`'s own combined-
-/// error handling for that case) -- deleting it here would make that
-/// failure irrecoverable. Best-effort: a failure here is logged, never
-/// escalated -- the abort itself (CS2 already killed, mutations already
-/// rolled back by the time this runs) has already succeeded regardless of
-/// whether cleanup does.
+/// `thermal.json`. Leaves `journal-*.jsonl` and `run.log` in place -- a
+/// scenario's journal is the only record that lets `rollback_now`/
+/// `emergency_rollback` repair the machine afterward, and the revert that
+/// ran alongside this Abort may itself have failed (see `run_scenario`'s and
+/// `execute`'s own combined-error handling for that case) -- deleting it
+/// here would make that failure irrecoverable. `results.json` is left alone
+/// too, though for a different reason: an aborted run almost never produces
+/// one (`execute()`'s `body` returns `Err` before REPORT in every ordinary
+/// abort), except one specific case -- an Abort observed at `finish_run`'s
+/// own final-revert-needs-reboot decision, which is reached *after*
+/// scoring/ROLLBACK/REPORT (and `results.save(...)`) have already run
+/// successfully. That `results.json` is a genuinely complete, scored record
+/// (not a stray/partial file); pruning it here would destroy the only
+/// record of an otherwise-finished run over a technicality (the very last
+/// scenario's revert not yet being live pending a manual reboot -- see the
+/// `LogLine` `finish_run` emits on that branch). Best-effort: a failure here
+/// is logged, never escalated -- the abort itself (CS2 already killed,
+/// mutations already rolled back by the time this runs) has already
+/// succeeded regardless of whether cleanup does.
 async fn prune_run_dir(run_dir: &PathBuf) {
     let mut entries = match tokio::fs::read_dir(run_dir).await {
         Ok(e) => e,
@@ -178,7 +191,9 @@ async fn prune_run_dir(run_dir: &PathBuf) {
 mod tests {
     use super::*;
     use crate::capture::runner::MockCaptureRunner;
+    use crate::run::execute::RunConfig;
     use crate::system::{MockController, SteamStatus};
+    use std::time::Duration;
 
     /// `prune_run_dir` must delete only forensic-value-free files
     /// (`scenario-*` capture directories, `thermal.json`) and leave
@@ -254,9 +269,19 @@ mod tests {
             thermal_sample_override: None,
             inter_scenario_break_seconds: 0,
             hwinfo_path: None,
+            shutdown_when_complete: false,
+            post_boot_settle: Duration::from_secs(0),
+            exe_path: PathBuf::from("voidframe.exe"),
         };
         let (_control_tx, control_rx) = mpsc::channel(1);
-        let mut handle = spawn_run(sys, capture, config, control_rx);
+        let (_shutdown_toggle_tx, shutdown_toggle_rx) = watch::channel(false);
+        let mut handle = spawn_run(
+            sys,
+            capture,
+            RunStart::Fresh(config),
+            control_rx,
+            shutdown_toggle_rx,
+        );
 
         let mut failed = 0;
         while let Some(ev) = handle.events.recv().await {
@@ -301,9 +326,19 @@ mod tests {
             thermal_sample_override: None,
             inter_scenario_break_seconds: 0,
             hwinfo_path: None,
+            shutdown_when_complete: false,
+            post_boot_settle: Duration::from_secs(0),
+            exe_path: PathBuf::from("voidframe.exe"),
         };
         let (_control_tx, control_rx) = mpsc::channel(1);
-        let mut handle = spawn_run(sys, capture, config, control_rx);
+        let (_shutdown_toggle_tx, shutdown_toggle_rx) = watch::channel(false);
+        let mut handle = spawn_run(
+            sys,
+            capture,
+            RunStart::Fresh(config),
+            control_rx,
+            shutdown_toggle_rx,
+        );
 
         while handle.events.recv().await.is_some() {}
         let _ = handle.join.await.unwrap();
@@ -355,9 +390,19 @@ mod tests {
             thermal_sample_override: None,
             inter_scenario_break_seconds: 0,
             hwinfo_path: None,
+            shutdown_when_complete: false,
+            post_boot_settle: Duration::from_secs(0),
+            exe_path: PathBuf::from("voidframe.exe"),
         };
         let (_control_tx, control_rx) = mpsc::channel(1);
-        let handle = spawn_run(sys, capture, config, control_rx);
+        let (_shutdown_toggle_tx, shutdown_toggle_rx) = watch::channel(false);
+        let handle = spawn_run(
+            sys,
+            capture,
+            RunStart::Fresh(config),
+            control_rx,
+            shutdown_toggle_rx,
+        );
         drop(handle.events);
 
         let _ = handle.join.await.unwrap();

@@ -76,7 +76,9 @@ pub fn regvalue_from_payload(p: &RegistryPayload) -> Result<RegValue> {
     })
 }
 
-fn value_to_json(v: &RegValue) -> serde_json::Value {
+/// Renders a [`RegValue`] as the `{"type": ..., "value": ...}` shape used by
+/// both the journal's inverse records and `read_registry_value`'s IPC view.
+pub fn value_to_json(v: &RegValue) -> serde_json::Value {
     match v {
         RegValue::Dword(n) => json!({ "type": "DWORD", "value": n }),
         RegValue::Qword(n) => json!({ "type": "QWORD", "value": n }),
@@ -190,6 +192,15 @@ mod tests {
     use crate::mutation::{apply_module, conflict_check};
     use crate::system::MockController;
 
+    /// A throwaway `no_return` shield for `apply_module`/`apply_scenario`:
+    /// these tests have no live run whose abort race could need shielding, and
+    /// nothing here observes the flag. The receiver is dropped immediately --
+    /// the only sender is `power_plan::apply`'s guard, which ignores send
+    /// errors.
+    fn no_return() -> tokio::sync::watch::Sender<bool> {
+        tokio::sync::watch::channel(false).0
+    }
+
     fn ctx() -> MutationCtx {
         MutationCtx {
             run_id: "r".into(),
@@ -205,6 +216,7 @@ mod tests {
             value_name: "HwSchMode".into(),
             value_type: RegType::Dword,
             value: serde_json::json!(v),
+            requires_reboot: false,
         })
     }
 
@@ -213,9 +225,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut j = Journal::open(&dir.path().join("j.jsonl")).unwrap();
         let mock = MockController::new();
-        apply_module(&reg_module(2), &mock, &mut j, &ctx())
-            .await
-            .unwrap();
+        apply_module(
+            &reg_module(2),
+            dir.path(),
+            &mock,
+            &mut j,
+            &ctx(),
+            &no_return(),
+        )
+        .await
+        .unwrap();
 
         let k = RegKey {
             hive: Hive::Hklm,
@@ -235,14 +254,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut j = Journal::open(&dir.path().join("j.jsonl")).unwrap();
         let mock = MockController::new().with_registry(
-            Hive::Hklm,
-            "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
-            "HwSchMode",
+            &RegKey {
+                hive: Hive::Hklm,
+                subkey: "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers".into(),
+                value_name: "HwSchMode".into(),
+            },
             RegValue::Dword(1),
         );
-        apply_module(&reg_module(2), &mock, &mut j, &ctx())
-            .await
-            .unwrap();
+        apply_module(
+            &reg_module(2),
+            dir.path(),
+            &mock,
+            &mut j,
+            &ctx(),
+            &no_return(),
+        )
+        .await
+        .unwrap();
         let recs = Journal::load_pending(j.path()).unwrap();
         assert_eq!(recs[0].inverse["kind"], "write");
         assert_eq!(recs[0].inverse["value"]["value"], 1);
@@ -262,6 +290,7 @@ mod tests {
             value_name: "V".into(),
             value_type: RegType::Dword,
             value: serde_json::json!("not a number"),
+            requires_reboot: false,
         };
         assert!(regvalue_from_payload(&p).is_err());
     }

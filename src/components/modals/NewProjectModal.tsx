@@ -1,12 +1,36 @@
 import React, { useState } from "react";
 import { X, Plus, Sparkles } from "lucide-react";
-import type { Project } from "../../lib/bindings";
+import type { BenchmarkKind, Project } from "../../lib/bindings";
 
 interface NewProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
   onCreateProject: (project: Project) => Promise<void>;
 }
+
+/** Per-kind defaults, in one place. `capture_seconds` mirrors the engine's
+ * own bound: Dust2's serde default (105) and AveYo's
+ * `AVEYO_MAX_CAPTURE_SECONDS` (57) in
+ * crates/voidframe-engine/src/model/settings.rs -- `Settings::validate`
+ * rejects an AveYo project above it, so a drift here fails loudly. `map_id`
+ * stays the real Dust2 addon id for every kind: it is inert for AveYo (spec
+ * 2026-09-09 D4) but must remain a valid id so a project whose kind is
+ * ever switched back to Dust2 still passes `Settings::validate`.
+ * `measure_loops` is each kind's calibrated default (see
+ * study/real-runs/3f3130b7-aveyo-measure-loops-15/measure-loops-15-verification-report.md):
+ * Dust2 stays 3, AveYo's default is 5 -- n=3 showed real reliability gaps for
+ * AveYo. It seeds the Measurement Loops select when a kind is picked but
+ * (unlike capture_seconds) remains independently overridable afterward. */
+const BENCHMARK_KINDS: ReadonlyArray<{
+  value: BenchmarkKind;
+  label: string;
+  capture_seconds: number;
+  measure_loops: number;
+}> = [
+  { value: "workshop_dust2", label: "Dust2 Workshop (default)", capture_seconds: 105, measure_loops: 3 },
+  { value: "aveyo_cfg_v2", label: "AveYo benchmark.cfg v2", capture_seconds: 57, measure_loops: 5 },
+];
+const DUST2_MAP_ID = "3240880604";
 
 export const NewProjectModal: React.FC<NewProjectModalProps> = ({
   isOpen,
@@ -16,7 +40,8 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [warmupLoops, setWarmupLoops] = useState(2);
-  const [measureLoops, setMeasureLoops] = useState(3);
+  const [measureLoops, setMeasureLoops] = useState(BENCHMARK_KINDS[0].measure_loops);
+  const [benchmarkKind, setBenchmarkKind] = useState<BenchmarkKind>("workshop_dust2");
 
   if (!isOpen) return null;
 
@@ -24,6 +49,7 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
     e.preventDefault();
     if (!name.trim()) return;
 
+    const kind = BENCHMARK_KINDS.find((k) => k.value === benchmarkKind) ?? BENCHMARK_KINDS[0];
     const newProject: Project = {
       schema_version: "2.0.0",
       id: `proj_${Date.now()}`,
@@ -34,10 +60,11 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
         schema_version: "2.0.0",
         warmup_loops: warmupLoops,
         measure_loops: measureLoops,
-        capture_seconds: 105,
-        map_id: "3240880604",
+        capture_seconds: kind.capture_seconds,
+        map_id: DUST2_MAP_ID,
         watchdog_seconds: 120,
         netcon_port: null,
+        benchmark_kind: kind.value,
       },
       baseline: {
         name: "Stock System Baseline",
@@ -98,6 +125,35 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
             />
           </div>
 
+          <div className="space-y-1.5">
+            <label className="text-xs font-mono text-white/70">Benchmark</label>
+            <div className="grid grid-cols-2 gap-2">
+              {BENCHMARK_KINDS.map((kind) => (
+                <label
+                  key={kind.value}
+                  className={`px-3 py-2 rounded-xl text-xs font-mono cursor-pointer border ${
+                    benchmarkKind === kind.value
+                      ? "border-[#06b6d4]/60 bg-[#06b6d4]/10 text-white"
+                      : "border-white/10 text-white/60"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="benchmarkKind"
+                    value={kind.value}
+                    checked={benchmarkKind === kind.value}
+                    onChange={() => {
+                      setBenchmarkKind(kind.value);
+                      setMeasureLoops(kind.measure_loops);
+                    }}
+                    className="sr-only"
+                  />
+                  {kind.label}
+                </label>
+              ))}
+            </div>
+          </div>
+
           <div className="grid grid-cols-2 gap-3 pt-1">
             <div className="space-y-1.5">
               <label className="text-xs font-mono text-white/70">Warmup Loops</label>
@@ -121,6 +177,7 @@ export const NewProjectModal: React.FC<NewProjectModalProps> = ({
               >
                 <option value={3} className="bg-[#040409]">3 Loops (Standard)</option>
                 <option value={5} className="bg-[#040409]">5 Loops (High Precision)</option>
+                <option value={8} className="bg-[#040409]">8 Loops (Best Reliability)</option>
               </select>
             </div>
           </div>

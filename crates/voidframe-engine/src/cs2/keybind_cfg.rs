@@ -1,12 +1,12 @@
 //! VOIDFRAME's own console keybind — a small `.cfg` file the engine writes
-//! to CS2's `cfg\` directory and always `+exec`s, so `reissue_map`
+//! to CS2's `cfg\` directory and always `+exec`s, so `send_console_command`
 //! (`system/windows/input.rs`) can rely on a known-good F9 binding
 //! regardless of the user's own keybind customization. Non-destructive:
 //! Source engine multi-binds (a new bind on an already-bound key doesn't
 //! remove the existing one) — confirmed on the dev rig, `spike/findings.md`
 //! §6b.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use std::path::Path;
 
 pub const CFG_FILENAME: &str = "voidframe_keybind.cfg";
@@ -19,10 +19,10 @@ pub const CFG_FILENAME: &str = "voidframe_keybind.cfg";
 // but pressing it does nothing. Reverted to the one bind actually proven
 // to open the console.
 //
-// The desync this cfg used to cause: `reissue_map`'s own closing step used
+// The desync this cfg used to cause: `send_console_command`'s own closing step used
 // to be a second F12 press against this same toggleconsole bind, sent
 // after a fixed delay — but a real cold map load can outlast that delay,
-// leaving the console open. The *next* reissue_map's opening F12 press
+// leaving the console open. The *next* send_console_command's opening F12 press
 // then toggled that already-open console CLOSED instead of open, and
 // every input after that (the typed map command, Enter) landed in the
 // live game instead of the console — confirmed live as the cause of a
@@ -53,15 +53,7 @@ const CFG_CONTENTS: &str = "con_enable \"true\"\nbind \"F9\" \"toggleconsole\"\n
 /// `SystemController::app_library_path`'s doc comment) — the caller
 /// resolves this path.
 pub fn ensure_written(cs2_cfg_dir: &Path) -> Result<()> {
-    // A real CS2 install always ships its `cfg\` directory already, so this
-    // is normally a no-op — but creating it defensively (rather than
-    // assuming it exists) costs nothing and matches this function's own
-    // "idempotent, safe to call every time" contract.
-    std::fs::create_dir_all(cs2_cfg_dir)
-        .map_err(|e| Error::msg(format!("creating {}: {e}", cs2_cfg_dir.display())))?;
-    let path = cs2_cfg_dir.join(CFG_FILENAME);
-    std::fs::write(&path, CFG_CONTENTS)
-        .map_err(|e| Error::msg(format!("writing {}: {e}", path.display())))
+    super::write_cfg_files(cs2_cfg_dir, &[(CFG_FILENAME, CFG_CONTENTS)])
 }
 
 pub fn reserved_tokens() -> Vec<String> {

@@ -34,16 +34,26 @@ pub async fn run_collect(project_path: &Path) -> anyhow::Result<DryRunOutcome> {
     let project = Project::load(project_path)?;
     let tmp = tempfile::tempdir()?;
     let mut scenarios = Vec::new();
+    // A dry run has no live abort race to shield against (`apply_scenario`'s
+    // `no_return` only matters inside a real `execute()` run) -- a throwaway
+    // channel satisfies the parameter. `_no_return_rx` is bound so the
+    // channel stays open for the loop's `send`s.
+    let (no_return_tx, _no_return_rx) = tokio::sync::watch::channel(false);
 
+    // Mirrors real project layout (`<project_dir>/project.json` +
+    // `<project_dir>/scripts/`, see `run/execute/scenario.rs::project_dir_for`):
+    // a `custom_script` module's `apply_script`/`revert_script` resolve
+    // against `project_path`'s own parent directory.
+    let project_dir = project_path.parent().unwrap_or_else(|| Path::new(""));
     for sc in project.enabled_scenarios() {
         // A fresh DryRun over a fresh Mock: reads see an empty system, writes
         // are logged only.
         let dry = DryRunController::new(MockController::new());
         let jp = tmp.path().join(format!("journal-{}.jsonl", sc.id));
         let mut j = Journal::open(&jp)?;
-        apply_scenario(sc, "dry-run", &dry, &mut j).await?;
+        apply_scenario(sc, "dry-run", project_dir, &dry, &mut j, &no_return_tx).await?;
         drop(j);
-        let report = revert_scenario(&sc.id, &jp, &dry).await?;
+        let report = revert_scenario(&sc.id, project_dir, &jp, &dry).await?;
         scenarios.push(ScenarioOutcome {
             id: sc.id.clone(),
             planned: dry.planned_mutations(),
@@ -61,16 +71,31 @@ pub async fn run_collect_windows(project_path: &Path) -> anyhow::Result<DryRunOu
     let project = Project::load(project_path)?;
     let tmp = tempfile::tempdir()?;
     let mut scenarios = Vec::new();
+    // A dry run has no live abort race to shield against (`apply_scenario`'s
+    // `no_return` only matters inside a real `execute()` run) -- a throwaway
+    // channel satisfies the parameter. `_no_return_rx` is bound so the
+    // channel stays open for the loop's `send`s.
+    let (no_return_tx, _no_return_rx) = tokio::sync::watch::channel(false);
 
+    // See `run_collect`'s identical comment above.
+    let project_dir = project_path.parent().unwrap_or_else(|| Path::new(""));
     for sc in project.enabled_scenarios() {
         // A fresh DryRun over the real WindowsController: reads see this
         // machine's actual current state, writes are logged only.
         let dry = DryRunController::new(WindowsController::new());
         let jp = tmp.path().join(format!("journal-{}.jsonl", sc.id));
         let mut j = Journal::open(&jp)?;
-        apply_scenario(sc, "dry-run-windows", &dry, &mut j).await?;
+        apply_scenario(
+            sc,
+            "dry-run-windows",
+            project_dir,
+            &dry,
+            &mut j,
+            &no_return_tx,
+        )
+        .await?;
         drop(j);
-        let report = revert_scenario(&sc.id, &jp, &dry).await?;
+        let report = revert_scenario(&sc.id, project_dir, &jp, &dry).await?;
         scenarios.push(ScenarioOutcome {
             id: sc.id.clone(),
             planned: dry.planned_mutations(),

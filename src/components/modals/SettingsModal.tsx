@@ -134,39 +134,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                 />
               </label>
 
-              <div className="grid grid-cols-3 gap-3">
-                <div className="space-y-1.5">
-                  <label htmlFor="default-warmup-loops" className="text-xs font-mono text-white/70">
-                    Default Warmup Loops
-                  </label>
-                  <input
-                    id="default-warmup-loops"
-                    type="number"
-                    value={config.default_warmup_loops ?? 2}
-                    onChange={(e) => setConfig({ ...config, default_warmup_loops: Number(e.target.value) })}
-                    className="w-full px-3.5 py-2 rounded-xl glass-input text-xs font-mono"
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-mono text-white/70">Default Measure Loops</label>
-                  <input
-                    type="number"
-                    value={config.default_measure_loops ?? 3}
-                    onChange={(e) => setConfig({ ...config, default_measure_loops: Number(e.target.value) })}
-                    className="w-full px-3.5 py-2 rounded-xl glass-input text-xs font-mono"
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-mono text-white/70">Default Capture (s)</label>
-                  <input
-                    type="number"
-                    value={config.default_capture_seconds ?? 105}
-                    onChange={(e) => setConfig({ ...config, default_capture_seconds: Number(e.target.value) })}
-                    className="w-full px-3.5 py-2 rounded-xl glass-input text-xs font-mono"
-                  />
-                </div>
-              </div>
-
               <label className="flex items-center justify-between p-3.5 rounded-xl bg-black/40 border border-white/5 cursor-pointer">
                 <div>
                   <div className="text-xs font-mono text-white/80">Dry Run by Default</div>
@@ -183,6 +150,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                   className="rounded bg-black/50 border-white/20 text-[#06b6d4] focus:ring-0 w-4 h-4 cursor-pointer"
                 />
               </label>
+
+              <label className="flex items-center justify-between p-3.5 rounded-xl bg-black/40 border border-white/5 cursor-pointer">
+                <div>
+                  <div className="text-xs font-mono text-white/80">Shut down when a run completes (default)</div>
+                  <div className="text-[10px] font-mono text-white/40 mt-0.5">
+                    Default state of the countdown modal's shutdown toggle -- off by default, an
+                    unattended shutdown is opt-in.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={config.shutdown_when_complete_default ?? false}
+                  onChange={(e) =>
+                    setConfig({ ...config, shutdown_when_complete_default: e.target.checked })
+                  }
+                  className="rounded bg-black/50 border-white/20 text-[#06b6d4] focus:ring-0 w-4 h-4 cursor-pointer"
+                />
+              </label>
+
+              <div className="space-y-1.5">
+                <label htmlFor="post-boot-settle-seconds" className="text-xs font-mono text-white/70">
+                  Post-boot Settle (seconds)
+                </label>
+                <input
+                  id="post-boot-settle-seconds"
+                  type="number"
+                  value={config.post_boot_settle_seconds ?? 180}
+                  onChange={(e) =>
+                    setConfig({ ...config, post_boot_settle_seconds: Number(e.target.value) })
+                  }
+                  className="w-full px-3.5 py-2 rounded-xl glass-input text-xs font-mono"
+                />
+              </div>
 
               <div className="pt-2 border-t border-white/10 space-y-2">
                 <p className="text-[10px] font-mono text-white/40">

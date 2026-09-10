@@ -23,7 +23,7 @@ use rand::rngs::StdRng;
 use voidframe_engine::capture::{aggregate_metrics, parse_presentmon_csv};
 use voidframe_engine::model::results::Verdict;
 use voidframe_engine::stats::v3::{
-    WcpsV3Weights, adaptive_frame_time_cv, evaluate_verdict, hotelling_t2_statistic,
+    Margin, WcpsV3Weights, adaptive_frame_time_cv, evaluate_verdict, hotelling_t2_statistic,
     load_calibrated_thresholds, mean_abs_animation_error_ms, stutter_count_pct, tost_evaluate,
 };
 
@@ -41,7 +41,7 @@ fn real_run_dir(run: &str, scenario: &str) -> PathBuf {
         .join(format!("scenario-{scenario}"))
 }
 
-fn throughput_margins() -> BTreeMap<String, f64> {
+fn throughput_margins() -> BTreeMap<String, Margin> {
     [
         ("avg_fps", 3.0),
         ("p1_fps", 3.0),
@@ -49,7 +49,7 @@ fn throughput_margins() -> BTreeMap<String, f64> {
         ("adaptive_frame_time_cv", 10.0),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
+    .map(|(k, v)| (k.to_string(), Margin::RelativePct(v)))
     .collect()
 }
 
@@ -254,7 +254,7 @@ fn tost_declared_same_rate_across_multiple_real_pairs() {
     ];
 
     let thresholds = load_calibrated_thresholds().unwrap();
-    let pacing_margins = thresholds.pacing_tost_margins_pct.clone();
+    let pacing_margins = thresholds.pacing_tost_margins.clone();
     let throughput_margins = throughput_margins();
     let throughput_names = ["avg_fps", "p1_fps", "p01_fps", "adaptive_frame_time_cv"];
     let pacing_names = ["stutter_count_pct", "mean_abs_animation_error_ms"];

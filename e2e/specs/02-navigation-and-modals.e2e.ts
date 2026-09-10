@@ -117,11 +117,17 @@ describe("Verified Tweaks (library) full-page view", () => {
     // a still-empty list. Assert another, unrelated entry disappears too --
     // otherwise this would pass vacuously even if the search filter never
     // actually ran at all (the target entry is already visible unfiltered).
+    //
+    // `list_catalog_tweaks_impl` (src-tauri/src/commands/catalog.rs)
+    // narrows the full catalog down to `ALPHA_CATALOG_IDS` for the M3 alpha
+    // scope -- only "Power Plan", "Exclude Core 0", "Launch Options", and
+    // "HAGS" are offered here; "Disable Core Parking" is a real catalog
+    // entry (data/catalog.json) but deliberately hidden from this picker.
     await $("text=Loading catalog…").waitForDisplayed({ reverse: true, timeout: 10_000 }).catch(() => {});
-    await expect($("h4=Disable Core Parking")).toBeDisplayed();
+    await expect($("h4=Power Plan")).toBeDisplayed();
     await typeIntoSearchBox(search, "Exclude Core 0");
     await expect($("h4=Exclude Core 0")).toBeDisplayed();
-    await expect($("h4=Disable Core Parking")).not.toExist();
+    await expect($("h4=Power Plan")).not.toExist();
     await search.setValue("");
 
     await $("button=Project Explorer").click();

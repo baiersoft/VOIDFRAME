@@ -97,4 +97,54 @@ mod tests {
         assert_eq!(snap.phase, Phase::Rollback);
         assert_eq!(snap.current_scenario.as_deref(), Some("s2"));
     }
+
+    /// Spec §3.3/§3.5: entering `RebootPending` must NOT clear the store --
+    /// the OS reboot kills the process, and a later `--resume` reads this
+    /// exact snapshot back to find the run to resume. Only `RunComplete`/
+    /// `RunFailed` clear it (already covered above by this match arm's
+    /// sibling branch).
+    #[tokio::test]
+    async fn reboot_pending_phase_is_persisted_and_not_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let store = voidframe_engine::store::spawn_store(root);
+        store.set_state(initial_state()).await.unwrap();
+        update_store_from_event(
+            &store,
+            &EngineEvent::PhaseChanged {
+                phase: Phase::RebootPending {
+                    reason: voidframe_engine::run::phase::RebootReason::ApplyNext,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let snap = store.snapshot().await.unwrap().unwrap();
+        assert!(matches!(snap.phase, Phase::RebootPending { .. }));
+    }
+
+    /// `Aborting` is run-scoped: it must advance `phase` but leave
+    /// `current_scenario` untouched -- a crash during abort-cleanup still
+    /// needs to know which scenario's journal was last live.
+    #[tokio::test]
+    async fn aborting_phase_keeps_current_scenario_for_crash_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = voidframe_engine::paths::DataRoot::with_base(dir.path().to_path_buf()).unwrap();
+        let store = voidframe_engine::store::spawn_store(root);
+        let mut state = initial_state();
+        state.current_scenario = Some("s2".into());
+        store.set_state(state).await.unwrap();
+
+        update_store_from_event(
+            &store,
+            &EngineEvent::PhaseChanged {
+                phase: Phase::Aborting,
+            },
+        )
+        .await
+        .unwrap();
+        let snap = store.snapshot().await.unwrap().unwrap();
+        assert_eq!(snap.phase, Phase::Aborting);
+        assert_eq!(snap.current_scenario.as_deref(), Some("s2"));
+    }
 }

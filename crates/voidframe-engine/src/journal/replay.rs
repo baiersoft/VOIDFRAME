@@ -17,13 +17,17 @@ use std::path::Path;
 /// as it would have been rejected on the way in, not merely trusted because
 /// it came from a journal file.
 ///
-/// Only `RegistryWrite`/`RegistryDelete` have a meaningful apply-side guard
-/// today (`require_m1_supported`'s NUL/length/`..`-segment/`\Enum\` checks
-/// on `subkey`/`value_name`); the `Powercfg`/`PowerPlan*` branches of
-/// `require_m1_supported` are unconditional `Ok(())`, so there is nothing to
-/// replicate for those ops without inventing a check the apply side doesn't
-/// itself have.
-fn validate_inverse(rec: &JournalRecord) -> std::result::Result<(), String> {
+/// `RegistryWrite`/`RegistryDelete` and `CustomScriptApply` have a
+/// meaningful apply-side guard today (`require_m1_supported`'s
+/// NUL/length/`..`-segment/`\Enum\` checks on `subkey`/`value_name` for the
+/// registry ops, `validate_script_path`'s character-allowlist/traversal/
+/// extension checks for `CustomScriptApply`'s `revert_path`); the
+/// `Powercfg`/`PowerPlan*`/`Cs2ConfigApply` branches of
+/// `require_m1_supported` are unconditional `Ok(())` (or, for
+/// `Cs2ConfigApply`, the inverse is a whole-file text snapshot with no path
+/// to validate at all), so there is nothing to replicate for those ops
+/// without inventing a check the apply side doesn't itself have.
+pub(crate) fn validate_inverse(rec: &JournalRecord) -> std::result::Result<(), String> {
     match rec.op {
         Op::RegistryWrite | Op::RegistryDelete => {
             let t = &rec.inverse["target"];
@@ -42,14 +46,37 @@ fn validate_inverse(rec: &JournalRecord) -> std::result::Result<(), String> {
                 value_name: t["value_name"].as_str().unwrap_or_default().to_string(),
                 value_type: crate::model::module::RegType::Dword,
                 value: serde_json::Value::Null,
+                requires_reboot: false,
             };
             crate::model::module::Module::Registry(payload)
                 .require_m1_supported()
                 .map_err(|e| format!("seq {}: inverse rejected: {e}", rec.seq))
         }
-        Op::PowercfgWrite | Op::PowerPlanActivate | Op::PowerPlanCreate | Op::PowerPlanDelete => {
-            Ok(())
+        Op::CustomScriptApply => {
+            // Only `revert_path` is attacker-controlled input worth
+            // validating here — `apply_script` is a placeholder never used
+            // for anything (this `Module` is validation-only, never
+            // applied), but it still has to satisfy `validate_script_path`
+            // itself or it would spuriously fail validation regardless of
+            // `revert_path`.
+            let payload = crate::model::module::CustomScriptPayload {
+                apply_script: "placeholder.bat".into(),
+                revert_script: rec.inverse["revert_path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                requires_reboot: false,
+                description: String::new(),
+            };
+            crate::model::module::Module::CustomScript(payload)
+                .require_m1_supported()
+                .map_err(|e| format!("seq {}: inverse rejected: {e}", rec.seq))
         }
+        Op::PowercfgWrite
+        | Op::PowerPlanActivate
+        | Op::PowerPlanCreate
+        | Op::PowerPlanDelete
+        | Op::Cs2ConfigApply => Ok(()),
     }
 }
 
@@ -68,13 +95,18 @@ pub struct RevertReport {
 
 /// Reverse-replay every record in `journal_path` (newest first) through
 /// `sys`, verifying each one by reading the value back. Each record's
-/// `inverse` is first checked by `validate_inverse` (private to this module) against the same
+/// `inverse` is first checked by `validate_inverse` (`pub(crate)` -- also called by
+/// `restore_script::render_record` for the same reason) against the same
 /// guards the apply side enforces; a record that fails validation is never
 /// reverted at all. A validation failure, revert failure, or verify failure
 /// is pushed to `verify_failures` — never thrown — so one bad record does
 /// not abort the rest of the rollback. Records with `applied: false` are
 /// still reverted defensively (the mutation may or may not have landed).
-pub async fn revert_all(journal_path: &Path, sys: &dyn SystemController) -> Result<RevertReport> {
+pub async fn revert_all(
+    project_dir: &Path,
+    journal_path: &Path,
+    sys: &dyn SystemController,
+) -> Result<RevertReport> {
     let mut records = Journal::load_pending(journal_path)?;
     records.sort_by_key(|r| std::cmp::Reverse(r.seq));
     let mut report = RevertReport::default();
@@ -89,7 +121,7 @@ pub async fn revert_all(journal_path: &Path, sys: &dyn SystemController) -> Resu
             report.verify_failures.push(msg);
             continue;
         }
-        match revert_record(rec, sys, &ctx).await {
+        match revert_record(rec, project_dir, sys, &ctx).await {
             Ok(()) => {
                 report.reverted += 1;
                 if let Err(msg) = verify(rec, sys).await {
@@ -161,7 +193,21 @@ async fn verify(
             }
             Ok(())
         }
-        Op::PowerPlanCreate | Op::PowerPlanDelete => Ok(()),
+        Op::Cs2ConfigApply => {
+            let want = rec.inverse["original_text"].as_str().unwrap_or_default();
+            let got = sys
+                .read_cs2_video_config()
+                .await
+                .map_err(|e| e.to_string())?;
+            if got != want {
+                return Err(format!(
+                    "seq {}: video.txt expected to match the pre-run snapshot, found a different value",
+                    rec.seq
+                ));
+            }
+            Ok(())
+        }
+        Op::PowerPlanCreate | Op::PowerPlanDelete | Op::CustomScriptApply => Ok(()),
     }
 }
 
@@ -169,9 +215,18 @@ async fn verify(
 mod tests {
     use super::*;
     use crate::journal::Journal;
-    use crate::model::module::{Hive, RegType, RegistryPayload};
+    use crate::model::module::{Cs2ConfigPayload, Hive, RegType, RegistryPayload};
     use crate::mutation::apply_module;
     use crate::system::{MockController, RegValue, SystemController};
+
+    /// A throwaway `no_return` shield for `apply_module`/`apply_scenario`:
+    /// these tests have no live run whose abort race could need shielding, and
+    /// nothing here observes the flag. The receiver is dropped immediately --
+    /// the only sender is `power_plan::apply`'s guard, which ignores send
+    /// errors.
+    fn no_return() -> tokio::sync::watch::Sender<bool> {
+        tokio::sync::watch::channel(false).0
+    }
 
     fn ctx() -> MutationCtx {
         MutationCtx {
@@ -199,9 +254,11 @@ mod tests {
                 setting: "IDLEDISABLE".into(),
                 value: 1,
             },
+            dir.path(),
             &mock,
             &mut j,
             &ctx(),
+            &no_return(),
         )
         .await
         .unwrap();
@@ -212,16 +269,19 @@ mod tests {
                 value_name: "HwSchMode".into(),
                 value_type: RegType::Dword,
                 value: serde_json::json!(2),
+                requires_reboot: false,
             }),
+            dir.path(),
             &mock,
             &mut j,
             &ctx(),
+            &no_return(),
         )
         .await
         .unwrap();
         drop(j);
 
-        let report = revert_all(&jp, &mock).await.unwrap();
+        let report = revert_all(dir.path(), &jp, &mock).await.unwrap();
         assert_eq!(report.reverted, 2);
         assert!(report.verify_failures.is_empty());
         assert_eq!(before, mock.snapshot());
@@ -245,17 +305,83 @@ mod tests {
                 setting: "IDLEDISABLE".into(),
                 value: 1,
             },
+            dir.path(),
             &mock,
             &mut j,
             &ctx(),
+            &no_return(),
         )
         .await
         .unwrap();
         drop(j);
         // Sabotage: make the revert write silently fail once so the value stays at 1.
         mock.fail_next_write("sabotage");
-        let report = revert_all(&jp, &mock).await.unwrap();
+        let report = revert_all(dir.path(), &jp, &mock).await.unwrap();
         assert_eq!(report.verify_failures.len(), 1);
+    }
+
+    /// Unlike `CustomScriptApply` (genuinely unverifiable -- no readable
+    /// state), `Cs2ConfigApply`'s revert effect is directly checkable: read
+    /// `video.txt` back and compare it to the journaled snapshot.
+    #[tokio::test]
+    async fn verify_succeeds_for_cs2_config_when_video_txt_matches_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let jp = dir.path().join("j.jsonl");
+        let mock = MockController::new()
+            .with_cs2_video_config("setting.defaultres 1920\nsetting.fullscreen 1\n");
+        let mut j = Journal::open(&jp).unwrap();
+        let mut settings = std::collections::BTreeMap::new();
+        settings.insert("setting.fullscreen".to_string(), "0".to_string());
+        apply_module(
+            &crate::model::Module::Cs2Config(Cs2ConfigPayload { settings }),
+            dir.path(),
+            &mock,
+            &mut j,
+            &ctx(),
+            &no_return(),
+        )
+        .await
+        .unwrap();
+        drop(j);
+
+        let recs = Journal::load_pending(&jp).unwrap();
+        revert_record(&recs[0], dir.path(), &mock, &ctx())
+            .await
+            .unwrap();
+
+        assert!(verify(&recs[0], &mock).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_reports_a_failure_for_cs2_config_when_video_txt_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let jp = dir.path().join("j.jsonl");
+        let mock = MockController::new()
+            .with_cs2_video_config("setting.defaultres 1920\nsetting.fullscreen 1\n");
+        let mut j = Journal::open(&jp).unwrap();
+        let mut settings = std::collections::BTreeMap::new();
+        settings.insert("setting.fullscreen".to_string(), "0".to_string());
+        apply_module(
+            &crate::model::Module::Cs2Config(Cs2ConfigPayload { settings }),
+            dir.path(),
+            &mock,
+            &mut j,
+            &ctx(),
+            &no_return(),
+        )
+        .await
+        .unwrap();
+        drop(j);
+
+        let recs = Journal::load_pending(&jp).unwrap();
+        // Simulate a failed/wrong revert: video.txt ends up with something
+        // other than the journaled pre-run snapshot.
+        mock.write_cs2_video_config("setting.defaultres 1920\nsetting.fullscreen 1\ncorrupted\n")
+            .await
+            .unwrap();
+
+        let err = verify(&recs[0], &mock).await.unwrap_err();
+        assert!(err.contains("video.txt"), "{err}");
     }
 
     /// H1 (replay-side validation): a journal file lives under
@@ -295,7 +421,7 @@ mod tests {
         j.mark_applied(seq).unwrap();
         drop(j);
 
-        let report = revert_all(&jp, &mock).await.unwrap();
+        let report = revert_all(dir.path(), &jp, &mock).await.unwrap();
         assert_eq!(report.reverted, 0, "the crafted record must not be applied");
         assert_eq!(report.verify_failures.len(), 1);
         assert!(
@@ -311,5 +437,82 @@ mod tests {
             value_name: "DevicePolicy".into(),
         };
         assert_eq!(mock.read_registry(&k).await.unwrap(), RegValue::Absent);
+    }
+
+    /// H1 for `CustomScriptApply` (Finding 3): a journal file lives under
+    /// `%LOCALAPPDATA%`, writable by the unelevated user, and `revert`
+    /// eventually runs `revert_path` as Administrator. A crafted inverse
+    /// whose `revert_path` contains a `..` traversal segment — exactly what
+    /// `model/module.rs`'s own `validate_script_path` tests already reject
+    /// on the apply side — must be rejected here too, not trusted just
+    /// because it came from a journal file.
+    #[tokio::test]
+    async fn revert_all_rejects_a_crafted_custom_script_inverse_with_a_traversal_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let jp = dir.path().join("j.jsonl");
+        let mock = MockController::new();
+
+        let mut j = Journal::open(&jp).unwrap();
+        let seq = j
+            .record(
+                Op::CustomScriptApply,
+                &ctx(),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!({
+                    "apply_sha256": "a",
+                    "revert_sha256": "b",
+                    "revert_path": "..\\..\\evil.bat",
+                }),
+            )
+            .unwrap();
+        j.mark_applied(seq).unwrap();
+        drop(j);
+
+        let report = revert_all(dir.path(), &jp, &mock).await.unwrap();
+        assert_eq!(report.reverted, 0, "the crafted record must not be applied");
+        assert_eq!(report.verify_failures.len(), 1);
+        assert!(
+            report.verify_failures[0].contains("inverse rejected"),
+            "{}",
+            report.verify_failures[0]
+        );
+    }
+
+    /// Same H1 guard, but for a `revert_path` carrying a shell
+    /// metacharacter (`&`) rather than a traversal segment — the other
+    /// rejection case `model/module.rs`'s own tests cover for
+    /// `validate_script_path`.
+    #[tokio::test]
+    async fn revert_all_rejects_a_crafted_custom_script_inverse_with_a_shell_metacharacter() {
+        let dir = tempfile::tempdir().unwrap();
+        let jp = dir.path().join("j.jsonl");
+        let mock = MockController::new();
+
+        let mut j = Journal::open(&jp).unwrap();
+        let seq = j
+            .record(
+                Op::CustomScriptApply,
+                &ctx(),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                serde_json::json!({
+                    "apply_sha256": "a",
+                    "revert_sha256": "b",
+                    "revert_path": "evil & calc.exe.bat",
+                }),
+            )
+            .unwrap();
+        j.mark_applied(seq).unwrap();
+        drop(j);
+
+        let report = revert_all(dir.path(), &jp, &mock).await.unwrap();
+        assert_eq!(report.reverted, 0, "the crafted record must not be applied");
+        assert_eq!(report.verify_failures.len(), 1);
+        assert!(
+            report.verify_failures[0].contains("inverse rejected"),
+            "{}",
+            report.verify_failures[0]
+        );
     }
 }

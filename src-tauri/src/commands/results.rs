@@ -1,4 +1,5 @@
 use std::path::Path;
+use voidframe_engine::model::progress::RunProgress;
 use voidframe_engine::model::results::{RunResults, RunSummary};
 use voidframe_engine::store::RunState;
 
@@ -85,17 +86,115 @@ pub async fn get_run_snapshot(
     state.store.snapshot().await.map_err(|e| e.to_string())
 }
 
+pub(crate) fn get_run_progress_impl(
+    runs_dir: &Path,
+    run_id: &str,
+) -> Result<Option<RunProgress>, String> {
+    validate_project_id(run_id)?;
+    let run_dir = runs_dir.join(run_id);
+    if !RunProgress::path(&run_dir).exists() {
+        return Ok(None);
+    }
+    RunProgress::load(&run_dir)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+#[specta::specta]
+#[tauri::command]
+pub async fn get_run_progress(
+    state: tauri::State<'_, crate::state::AppState>,
+    run_id: String,
+) -> Result<Option<RunProgress>, String> {
+    let runs_dir = state.data_root.runs_dir();
+    tokio::task::spawn_blocking(move || get_run_progress_impl(&runs_dir, &run_id))
+        .await
+        .map_err(|e| super::join_error_to_string("get_run_progress", e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voidframe_engine::model::progress::{Cursor, Stage};
+    use voidframe_engine::model::project::{Baseline, Project, Scenario};
     use voidframe_engine::model::results::{Metrics, ScenarioResult, Verdict};
     use voidframe_engine::run::DetectionTier;
+    use voidframe_engine::system::PowerPlan;
 
     #[test]
     fn get_results_rejects_a_traversal_run_id() {
         let dir = tempfile::tempdir().unwrap();
         let err = get_results_impl(dir.path(), "../../../etc/passwd").unwrap_err();
         assert!(err.contains("invalid project id")); // validate_project_id's own error message
+    }
+
+    fn dummy_progress(run_id: &str) -> RunProgress {
+        RunProgress {
+            schema_version: voidframe_engine::model::SCHEMA_VERSION.to_string(),
+            run_id: run_id.into(),
+            project: Project {
+                schema_version: voidframe_engine::model::SCHEMA_VERSION.to_string(),
+                id: "p1".into(),
+                name: "P".into(),
+                description: "d".into(),
+                created_at: "2026-09-06T00:00:00Z".into(),
+                settings: serde_json::from_str("{}").unwrap(),
+                baseline: Baseline {
+                    name: "Stock".into(),
+                    description: "d".into(),
+                },
+                scenarios: vec![Scenario {
+                    id: "hags".into(),
+                    name: "HAGS".into(),
+                    description: "d".into(),
+                    enabled: true,
+                    modules: vec![],
+                }],
+            },
+            start_build_id: None,
+            start_launch_args: "-novid".into(),
+            start_launch_args_raw: "-novid".into(),
+            start_power_plan: PowerPlan {
+                guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+                name: "Balanced".into(),
+                active: true,
+            },
+            thermal_baseline: None,
+            completed: vec![],
+            unstable: vec![],
+            cursor: Cursor {
+                index: 0,
+                stage: Stage::Measure,
+            },
+            reboot: None,
+            shutdown_when_complete: false,
+            skip_revert_once: false,
+            abort_requested: false,
+        }
+    }
+
+    #[test]
+    fn get_run_progress_rejects_a_traversal_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = get_run_progress_impl(dir.path(), "../../../etc/passwd").unwrap_err();
+        assert!(err.contains("invalid project id"));
+    }
+
+    #[test]
+    fn get_run_progress_is_none_when_progress_json_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = get_run_progress_impl(dir.path(), "r1").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_run_progress_returns_the_loaded_progress_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = dummy_progress("r1");
+        progress.save(&dir.path().join("r1")).unwrap();
+
+        let result = get_run_progress_impl(dir.path(), "r1").unwrap();
+        assert_eq!(result, Some(progress));
     }
 
     fn dummy_metrics() -> Metrics {
@@ -129,6 +228,7 @@ mod tests {
             metric_deltas: vec![],
             wcps: 0.0,
             verdict: Verdict::ConfirmedSame,
+            script_reverted_unverified: false,
         };
         RunResults {
             schema_version: "1.0.0".into(),
@@ -138,6 +238,7 @@ mod tests {
             detection_tier: DetectionTier::LogTail,
             baseline,
             scenarios: vec![],
+            unstable: vec![],
         }
     }
 

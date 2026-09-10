@@ -67,6 +67,28 @@ impl<C: SystemController> SystemController for DryRunController<C> {
         self.note(format!("powercfg.write {sub}/{setting} = {v}"));
         Ok(())
     }
+    async fn find_cs2_video_config_path(&self) -> Result<std::path::PathBuf> {
+        self.inner.find_cs2_video_config_path().await
+    }
+    async fn read_cs2_video_config(&self) -> Result<String> {
+        self.inner.read_cs2_video_config().await
+    }
+    async fn write_cs2_video_config(&self, text: &str) -> Result<()> {
+        self.note(format!("cs2_video_config.write ({} bytes)", text.len()));
+        Ok(())
+    }
+    async fn run_script(
+        &self,
+        path: &std::path::Path,
+        _timeout: std::time::Duration,
+    ) -> Result<ScriptOutput> {
+        self.note(format!("run_script {}", path.display()));
+        Ok(ScriptOutput {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
     async fn list_power_plans(&self) -> Result<Vec<PowerPlan>> {
         self.inner.list_power_plans().await
     }
@@ -151,8 +173,8 @@ impl<C: SystemController> SystemController for DryRunController<C> {
         self.note(format!("kill_process_tree pid={pid}"));
         Ok(())
     }
-    async fn reissue_map(&self, map_command: &str) -> Result<()> {
-        self.note(format!("reissue_map {map_command}"));
+    async fn send_console_command(&self, command: &str) -> Result<()> {
+        self.note(format!("send_console_command {command}"));
         Ok(())
     }
     async fn hide_console(&self) -> Result<()> {
@@ -183,6 +205,39 @@ impl<C: SystemController> SystemController for DryRunController<C> {
     }
     async fn read_hwinfo_sensors(&self) -> Result<HwinfoSensorSnapshot> {
         self.inner.read_hwinfo_sensors().await
+    }
+    async fn reboot(&self, delay_secs: u32, message: &str) -> Result<()> {
+        self.note(format!("reboot in {delay_secs}s: {message}"));
+        Ok(())
+    }
+    async fn shutdown(&self, delay_secs: u32, message: &str) -> Result<()> {
+        self.note(format!("shutdown in {delay_secs}s: {message}"));
+        Ok(())
+    }
+    async fn cancel_shutdown(&self) -> Result<()> {
+        self.note("cancel_shutdown".to_string());
+        Ok(())
+    }
+    async fn register_task(&self, spec: &TaskSpec) -> Result<()> {
+        self.note(format!("register_task {} ({:?})", spec.name, spec.trigger));
+        Ok(())
+    }
+    async fn deregister_task(&self, name: &str) -> Result<()> {
+        self.note(format!("deregister_task {name}"));
+        Ok(())
+    }
+    async fn task_exists(&self, name: &str) -> Result<bool> {
+        self.inner.task_exists(name).await
+    }
+    async fn boot_report(&self, since: std::time::SystemTime) -> Result<BootReport> {
+        self.inner.boot_report(since).await
+    }
+    async fn bitlocker_protection(&self) -> Result<BitlockerStatus> {
+        self.inner.bitlocker_protection().await
+    }
+    async fn inhibit_sleep(&self, on: bool) -> Result<()> {
+        self.note(format!("inhibit_sleep {on}"));
+        Ok(())
     }
 }
 
@@ -257,11 +312,11 @@ mod tests {
         dry.launch_cs2(&Cs2LaunchSpec { app_id: 730 })
             .await
             .unwrap();
-        dry.reissue_map("map de_dust2").await.unwrap();
+        dry.send_console_command("map de_dust2").await.unwrap();
 
         // inner is untouched
         assert_eq!(mock.read_cs2_launch_options().await.unwrap(), "");
-        assert!(mock.reissue_map_calls().is_empty());
+        assert!(mock.send_console_command_calls().is_empty());
 
         // but every call was logged
         let log = dry.planned_mutations();

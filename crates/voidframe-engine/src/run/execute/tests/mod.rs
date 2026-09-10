@@ -9,18 +9,23 @@ use tokio::io::AsyncWriteExt;
 // `use super::*;` resolves the same set of names the old single `tests.rs`
 // had in scope via its own `use super::*;` -- none of them are used by this
 // file's own (non-test) code.
+use super::launch::prepare_cs2_session;
 use super::scenario::run_scenario_inner;
 use super::steam::{graceful_kill_cs2, wait_for_process};
 use crate::journal::Journal;
 use crate::model::project::Scenario;
 use crate::model::results::Verdict;
 use crate::model::{AffinityCpuPayload, Module, Settings};
+use crate::run::RunOutcome;
 use crate::system::{MutationCtx, PowerPlan};
 use std::path::Path;
 
+mod abort;
 mod launch_args;
 mod preflight;
+mod reboot;
 mod scenario;
+mod scoring;
 mod steam;
 mod thermal;
 
@@ -60,6 +65,9 @@ fn config_with(data_root: PathBuf, settings: Settings, console_log_path: PathBuf
         thermal_sample_override: None,
         inter_scenario_break_seconds: 0,
         hwinfo_path: None,
+        shutdown_when_complete: false,
+        post_boot_settle: Duration::from_secs(0),
+        exe_path: PathBuf::from("voidframe.exe"),
     }
 }
 
@@ -79,6 +87,36 @@ fn context_for(config: &RunConfig) -> RunContext<'_> {
             active: true,
         },
         abort: tokio::sync::watch::channel(false).1,
+        no_return: tokio::sync::watch::channel(false).0,
+    }
+}
+
+/// A minimal `RunProgress` for the tests that drive `rollback()` directly.
+/// Only two of its fields matter to that function: `project` (which
+/// `ordered_scenarios` walks) and `cursor` (which scenario, if any, was in
+/// flight when the run failed). `Stage::Done` is the "nothing in flight"
+/// value -- see `rollback::in_flight_journal`.
+fn progress_at(config: &RunConfig, index: u32, stage: Stage) -> RunProgress {
+    RunProgress {
+        schema_version: crate::model::SCHEMA_VERSION.to_string(),
+        run_id: config.run_id.clone(),
+        project: config.project.clone(),
+        start_build_id: None,
+        start_launch_args: String::new(),
+        start_launch_args_raw: String::new(),
+        start_power_plan: PowerPlan {
+            guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+            name: "Balanced".into(),
+            active: true,
+        },
+        thermal_baseline: None,
+        completed: vec![],
+        unstable: vec![],
+        cursor: Cursor { index, stage },
+        reboot: None,
+        shutdown_when_complete: false,
+        skip_revert_once: false,
+        abort_requested: false,
     }
 }
 
@@ -109,6 +147,7 @@ fn scenario_with_modules(id: &str) -> Scenario {
                 value_name: "HwSchMode".into(),
                 value_type: RegType::Dword,
                 value: serde_json::json!(2),
+                requires_reboot: false,
             }),
             Module::Powercfg {
                 sub: "sub_processor".into(),
@@ -222,8 +261,17 @@ async fn execute_returns_a_non_aborted_error_when_rollback_also_fails_after_an_a
     control_tx.send(ControlMsg::Pause).await.unwrap();
     control_tx.send(ControlMsg::Abort).await.unwrap();
     let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
 
-    let exec = execute(sys, capture, config, events_tx, control_rx, abort_rx);
+    let exec = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    );
     // Waits until baseline's own `launch_cs2` call has already happened
     // (confirmed via the mock's own call counter, not a real sleep -- safe
     // under `tokio::time::pause()`) before arming `fail_next_write`, so it
@@ -258,6 +306,200 @@ async fn execute_returns_a_non_aborted_error_when_rollback_also_fails_after_an_a
     assert!(
         msg.contains("disk full"),
         "expected the combined error to include the underlying rollback error, got: {msg}"
+    );
+}
+
+/// **The critical safety-bug regression this fix exists for**: an operator
+/// Abort whose own ROLLBACK *succeeds* must never trigger D8's auto-shutdown
+/// branch, even with `shutdown_when_complete: true` live at the time of the
+/// abort. Before this fix, that branch only asked "did ROLLBACK succeed?" --
+/// never "was this actually an operator Abort?" -- so clicking Abort mid-run
+/// and having its rollback succeed (the common case) shut the machine down
+/// anyway, unattended, while the operator was still right there. Same setup
+/// as `execute_returns_a_non_aborted_error_when_rollback_also_fails_after_an_abort`
+/// (a control channel with `Pause` then `Abort` pre-queued, so the warmup
+/// iteration's `honor_pause` checkpoint unblocks with an aborted error) but
+/// with NO `fail_next_write` armed, so ROLLBACK's own `set_active_power_plan`
+/// call succeeds against a clean mock -- the exact "abort + clean rollback"
+/// combination D8's `else if` branch must now exclude.
+#[tokio::test]
+async fn execute_never_shuts_down_after_an_operator_abort_even_with_a_successful_rollback() {
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    write_signatures(dir.path());
+    let settings = settings_with(1, 0, 5); // 1 warmup iteration, 0 measure
+    let desired_args = crate::cs2::keybind_cfg::reconcile("");
+    let mock = MockController::new()
+        .with_steam_status(SteamStatus {
+            running: true,
+            elevated: false,
+        })
+        .with_launch_options(&desired_args)
+        .with_process_on_launch("cs2.exe", 8181);
+    let sys: Arc<dyn SystemController> = Arc::new(mock.clone());
+    let capture: Arc<dyn CaptureRunner> = Arc::new(MockCaptureRunner::new(vec![]));
+
+    let mut config = config_with(
+        dir.path().to_path_buf(),
+        settings,
+        dir.path().join("console.log"),
+    );
+    config.mock_cs2_log = Some(Duration::from_millis(0));
+    config.shutdown_when_complete = true;
+
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let (control_tx, control_rx) = mpsc::channel(4);
+    // Same ordering requirement as the sibling test above: `honor_pause`
+    // only ever treats a subsequent `Abort` as meaningful while genuinely
+    // paused, so `Pause` must come first.
+    control_tx.send(ControlMsg::Pause).await.unwrap();
+    control_tx.send(ControlMsg::Abort).await.unwrap();
+    let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    // Matches `config.shutdown_when_complete` -- see `reboot.rs`'s own `run`
+    // helper doc comment on why a mismatched initial value here would be
+    // misleading (not needed for correctness in this single-shot test, but
+    // keeps this test's setup honest about what a real caller would do).
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(true);
+
+    let result = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    )
+    .await;
+    drop(events_rx);
+
+    let err = result.expect_err("an aborted run must still return Err");
+    assert!(
+        err.is_aborted(),
+        "expected a clean aborted error, got: {err}"
+    );
+    assert_eq!(
+        mock.shutdown_calls(),
+        0,
+        "an operator Abort must never trigger D8's auto-shutdown, even with \
+         shutdown_when_complete true and a successful rollback"
+    );
+}
+
+/// The success-path counterpart to `execute_never_shuts_down_after_an_operator_
+/// abort_even_with_a_successful_rollback` above: that test drives an Abort
+/// through `scenario_loop`'s `Err` exit (D8's own `else if` branch in
+/// `execute`'s `Err(body_err)` match arm). This one instead lands the run at
+/// `Ok(LoopExit::Done)` -- the success path, reaching `finish_run` the way a
+/// clean run genuinely does -- because `maybe_break` (the loop's one abort
+/// checkpoint) is deliberately never reached after the last scenario, and
+/// nothing else in `Stage::Revert`/`Stage::Done`/`finish_run` itself reads
+/// `ctx.abort` at all. Hand-builds a `RunProgress` already at `Stage::Done`
+/// with one completed baseline result (mirroring exactly what a real run's
+/// last `Stage::Revert` -> `Stage::Done` transition saves to disk, per
+/// `begin_resume_skips_the_settle_wait_on_the_final_revert_only_resume`'s own
+/// doc comment on why `Stage::Done` uniquely identifies that resume) and
+/// calls `finish_run` with `abort` already `true`. If `finish_run`'s
+/// shutdown condition doesn't also exclude an aborted run, this reaches
+/// `sys.shutdown()` despite the abort.
+///
+/// Calls `finish_run` directly rather than through `execute()` (2026-09-07
+/// instant-abort spec): `execute()` now races the whole body against Abort,
+/// so an Abort observed *before* `finish_run` starts drops the body and
+/// never reaches this guard at all. The case the guard is actually for is an
+/// Abort landing *during* `finish_run`'s own scoring/ROLLBACK/REPORT work --
+/// `finish_run` engages the `no_return` shield on its first line, so the
+/// race defers that Abort and lets `finish_run` run to exactly this check.
+/// Reproducing that window through `execute()` would mean arming the abort
+/// inside a stretch that emits no event and never yields, so this drives
+/// `finish_run` with the same state the shield hands it instead.
+#[tokio::test]
+async fn finish_run_never_shuts_down_after_an_operator_abort_reaches_the_success_path() {
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let desired_args = crate::cs2::keybind_cfg::reconcile("");
+    let mock = MockController::new().with_launch_options(&desired_args);
+    let sys: Arc<dyn SystemController> = Arc::new(mock.clone());
+
+    let config = config_with(
+        dir.path().to_path_buf(),
+        settings_with(0, 3, 5),
+        dir.path().join("console.log"),
+    );
+
+    let baseline_result = ScenarioResult {
+        scenario_id: "baseline".into(),
+        name: "baseline".into(),
+        is_baseline: true,
+        aggregated: crate::mock_harness::mock_metrics(),
+        per_iteration: vec![crate::mock_harness::mock_metrics()],
+        metric_deltas: vec![],
+        wcps: 0.0,
+        verdict: Verdict::ConfirmedSame,
+        script_reverted_unverified: false,
+    };
+    let progress = RunProgress {
+        schema_version: crate::model::SCHEMA_VERSION.to_string(),
+        run_id: config.run_id.clone(),
+        project: config.project.clone(),
+        start_build_id: None,
+        start_launch_args: String::new(),
+        start_launch_args_raw: String::new(),
+        start_power_plan: PowerPlan {
+            guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+            name: "Balanced".into(),
+            active: true,
+        },
+        thermal_baseline: None,
+        completed: vec![baseline_result],
+        unstable: vec![],
+        cursor: Cursor {
+            index: 0,
+            stage: Stage::Done,
+        },
+        reboot: Some(PendingReboot {
+            reason: RebootReason::RevertOnly,
+            scenario_id: "baseline".into(),
+            initiated_at: "2026-09-06T00:00:00Z".into(),
+            boot_count: 0,
+        }),
+        shutdown_when_complete: true,
+        skip_revert_once: false,
+        abort_requested: false,
+    };
+
+    let (events_tx, events_rx) = mpsc::channel(64);
+    // `true` for this whole call, not toggled via an armer -- the point is
+    // that NOTHING inside `finish_run` up to its shutdown decision reads
+    // this receiver, so its value on entry is exactly as dangerous as a
+    // value flipped moments before that check.
+    let (_abort_tx, abort_rx) = tokio::sync::watch::channel(true);
+
+    let ctx = RunContext {
+        config: &config,
+        start_build_id: progress.start_build_id.clone(),
+        start_launch_args: progress.start_launch_args.clone(),
+        start_launch_args_raw: progress.start_launch_args_raw.clone(),
+        start_power_plan: progress.start_power_plan.clone(),
+        abort: abort_rx,
+        // Already engaged, exactly as the real `finish_run` sets it on its
+        // own first line -- see this test's doc comment.
+        no_return: tokio::sync::watch::channel(true).0,
+    };
+    let mut progress = progress;
+    let result = finish_run(sys.as_ref(), &ctx, &mut progress, false, vec![], &events_tx).await;
+    drop(events_rx);
+
+    assert!(
+        matches!(result.unwrap(), RunOutcome::Complete(_)),
+        "an aborted run reaching finish_run's success path must still complete normally, not \
+         shut down"
+    );
+    assert_eq!(
+        mock.shutdown_calls(),
+        0,
+        "an operator Abort observed anywhere up through finish_run's own work must never let \
+         the success path's D3 auto-shutdown fire, even with shutdown_when_complete true"
     );
 }
 
@@ -315,8 +557,17 @@ async fn rollback_still_restores_launch_options_when_the_power_plan_restore_fail
     let (events_tx, events_rx) = mpsc::channel(256);
     let (_control_tx, control_rx) = mpsc::channel(4);
     let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
 
-    let exec = execute(sys, capture, config, events_tx, control_rx, abort_rx);
+    let exec = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    );
     // Polls via a short real `sleep` rather than `yield_now` in a bare loop:
     // unlike the `execute_returns_a_non_aborted_error_when_rollback_also_fails_after_an_abort`
     // armer above (whose single `launch_cs2_calls() == 0` condition is
@@ -350,4 +601,114 @@ async fn rollback_still_restores_launch_options_when_the_power_plan_restore_fail
         "the launch-options restore must still run and succeed even though the power-plan \
          restore failed first"
     );
+}
+
+#[tokio::test]
+async fn resolve_real_video_txt_path_returns_the_controllers_seeded_path() {
+    let mock = MockController::new()
+        .with_cs2_video_config_path(r"D:\Steam\userdata\1\730\local\cfg\cs2_video.txt");
+    let sys: Arc<dyn SystemController> = Arc::new(mock);
+
+    let path = resolve_real_video_txt_path(sys.as_ref()).await;
+
+    assert_eq!(
+        path,
+        Some(PathBuf::from(
+            r"D:\Steam\userdata\1\730\local\cfg\cs2_video.txt"
+        )),
+        "must resolve through SystemController::find_cs2_video_config_path, not a direct \
+         system::windows reach-around"
+    );
+}
+
+/// Spec section 6 / D6: a scenario whose modules include `custom_script`
+/// gets its result flagged `script_reverted_unverified` once a real revert
+/// completes, because VOIDFRAME ran the revert script but cannot verify what
+/// it actually did to the system. Drives a full `execute()` run (not a
+/// direct call into the flag-setting logic) so this exercises the real
+/// `Stage::Measure` -> `Stage::Revert` sequencing: `scenario_result` builds
+/// the `ScenarioResult` during `Stage::Measure`, before the scenario's own
+/// revert has run at all, so the flag can only be patched in afterward.
+#[tokio::test]
+async fn a_custom_script_scenarios_result_is_marked_script_reverted_unverified_after_a_real_revert()
+{
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    write_signatures(dir.path());
+    let scripts_dir = dir.path().join("projects").join("proj1").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    std::fs::write(scripts_dir.join("apply.bat"), "echo apply").unwrap();
+    std::fs::write(scripts_dir.join("revert.bat"), "echo revert").unwrap();
+
+    let settings = settings_with(0, 3, 5);
+    let start_args = crate::cs2::keybind_cfg::reconcile("");
+    let mock = MockController::new()
+        .with_steam_status(SteamStatus {
+            running: true,
+            elevated: false,
+        })
+        .with_process("steam.exe", 9701)
+        .with_process_on_deelevate("steam.exe", 9702)
+        .with_process("steamwebhelper.exe", 9799)
+        .with_process_on_launch("cs2.exe", 9800)
+        .with_launch_options(&start_args);
+    let sys: Arc<dyn SystemController> = Arc::new(mock.clone());
+    let capture: Arc<dyn CaptureRunner> = Arc::new(MockCaptureRunner::new(vec![
+        crate::mock_harness::mock_metrics(),
+    ]));
+
+    let mut config = config_with(
+        dir.path().to_path_buf(),
+        settings,
+        dir.path().join("console.log"),
+    );
+    config.project.id = "proj1".into();
+    config.mock_cs2_log = Some(Duration::from_millis(0));
+    config.project.scenarios.push(Scenario {
+        id: "sc-custom-script".into(),
+        name: "CustomScript".into(),
+        description: "d".into(),
+        enabled: true,
+        modules: vec![Module::CustomScript(
+            crate::model::module::CustomScriptPayload {
+                apply_script: "apply.bat".into(),
+                revert_script: "revert.bat".into(),
+                requires_reboot: false,
+                description: "d".into(),
+            },
+        )],
+    });
+
+    let (events_tx, events_rx) = mpsc::channel(256);
+    let (_control_tx, control_rx) = mpsc::channel(4);
+    let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
+
+    let outcome = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    )
+    .await
+    .unwrap();
+    drop(events_rx);
+
+    let result = match outcome {
+        RunOutcome::Complete(r) => r,
+        other => panic!("expected RunOutcome::Complete, got {other:?}"),
+    };
+
+    let scenario_result = result
+        .scenarios
+        .iter()
+        .find(|r| r.scenario_id == "sc-custom-script")
+        .expect("scenario result should exist");
+    assert!(scenario_result.script_reverted_unverified);
+
+    // The baseline scenario has no custom_script module -- must stay false.
+    assert!(!result.baseline.script_reverted_unverified);
 }

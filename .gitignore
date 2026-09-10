@@ -43,3 +43,6 @@ data/results/*
 
 # superpowers SDD scratch (ledgers, briefs, review packages)
 .superpowers/
+
+# Git worktrees created for isolated feature work
+.worktrees/

@@ -165,6 +165,109 @@ describe("MatrixBuilder", () => {
     );
   });
 
+  it("clicking Rename Scenario reveals an editable input pre-filled with the current name", () => {
+    render(
+      <MatrixBuilder
+        project={project()}
+        onUpdateProject={vi.fn()}
+        onOpenTweakCatalog={vi.fn()}
+        onRunProject={vi.fn()}
+        isStarting={false}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: /rename scenario/i }));
+    const input = screen.getByRole("textbox", { name: /scenario name/i });
+    expect(input).toHaveValue("Scenario 1");
+  });
+
+  it("typing a new name and pressing Enter calls onUpdateProject with the scenario's name updated and every other field unchanged", () => {
+    const onUpdateProject = vi.fn();
+    const proj = project();
+    render(
+      <MatrixBuilder
+        project={proj}
+        onUpdateProject={onUpdateProject}
+        onOpenTweakCatalog={vi.fn()}
+        onRunProject={vi.fn()}
+        isStarting={false}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: /rename scenario/i }));
+    const input = screen.getByRole("textbox", { name: /scenario name/i });
+    fireEvent.change(input, { target: { value: "Renamed Scenario" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onUpdateProject).toHaveBeenCalledWith({
+      ...proj,
+      scenarios: [{ ...proj.scenarios![0], name: "Renamed Scenario" }],
+    });
+  });
+
+  it("typing a new name and blurring calls onUpdateProject with the scenario's name updated", () => {
+    const onUpdateProject = vi.fn();
+    const proj = project();
+    render(
+      <MatrixBuilder
+        project={proj}
+        onUpdateProject={onUpdateProject}
+        onOpenTweakCatalog={vi.fn()}
+        onRunProject={vi.fn()}
+        isStarting={false}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: /rename scenario/i }));
+    const input = screen.getByRole("textbox", { name: /scenario name/i });
+    fireEvent.change(input, { target: { value: "Blur Renamed" } });
+    fireEvent.blur(input);
+
+    expect(onUpdateProject).toHaveBeenCalledWith({
+      ...proj,
+      scenarios: [{ ...proj.scenarios![0], name: "Blur Renamed" }],
+    });
+  });
+
+  it("pressing Escape cancels the rename without calling onUpdateProject and reverts the displayed name", () => {
+    const onUpdateProject = vi.fn();
+    render(
+      <MatrixBuilder
+        project={project()}
+        onUpdateProject={onUpdateProject}
+        onOpenTweakCatalog={vi.fn()}
+        onRunProject={vi.fn()}
+        isStarting={false}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: /rename scenario/i }));
+    const input = screen.getByRole("textbox", { name: /scenario name/i });
+    fireEvent.change(input, { target: { value: "Should Not Save" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(onUpdateProject).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "Scenario 1" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /scenario name/i })).not.toBeInTheDocument();
+  });
+
+  it("committing an empty/whitespace-only name does not save it and reverts to the original name", () => {
+    const onUpdateProject = vi.fn();
+    render(
+      <MatrixBuilder
+        project={project()}
+        onUpdateProject={onUpdateProject}
+        onOpenTweakCatalog={vi.fn()}
+        onRunProject={vi.fn()}
+        isStarting={false}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: /rename scenario/i }));
+    const input = screen.getByRole("textbox", { name: /scenario name/i });
+    fireEvent.change(input, { target: { value: "   " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onUpdateProject).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "Scenario 1" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /scenario name/i })).not.toBeInTheDocument();
+  });
+
   it("adding a scenario produces a real Scenario shape (empty modules array, no rebootRequired/tweaks fields)", () => {
     const onUpdateProject = vi.fn();
     render(
@@ -282,5 +385,42 @@ describe("MatrixBuilder estimator math", () => {
     // This directly exercises the `capture_seconds ?? 105` fallback (unlike totalRuns/
     // totalMeasureRuns/totalWarmupRuns above, which don't depend on capture_seconds at all).
     expect(screen.getByText("~20 min")).toBeInTheDocument();
+  });
+
+  it("shows a reboot badge on a HAGS scenario and a reboot count in the estimate area", () => {
+    const rebootProject: Project = {
+      schema_version: "1.0.0",
+      id: "p1",
+      name: "Reboot Test",
+      description: "d",
+      created_at: "2026-09-01T00:00:00Z",
+      settings: { warmup_loops: 2, measure_loops: 3, capture_seconds: 60 },
+      baseline: { name: "Stock", description: "d" },
+      scenarios: [
+        {
+          id: "s1",
+          name: "HAGS On",
+          description: "d",
+          enabled: true,
+          modules: [
+            {
+              type: "registry",
+              hive: "HKLM",
+              subkey: "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+              value_name: "HwSchMode",
+              value_type: "DWORD",
+              value: 2,
+              requires_reboot: true,
+            },
+          ],
+        },
+      ],
+    };
+    render(
+      <MatrixBuilder project={rebootProject} onUpdateProject={vi.fn()} onOpenTweakCatalog={vi.fn()} onRunProject={vi.fn()} isStarting={false} />
+    );
+    expect(screen.getByText(/reboot/i, { selector: "span" })).toBeInTheDocument();
+    // countReboots([true]) === 2 (apply-reboot, then a final revert-reboot).
+    expect(screen.getByText(/2 reboots/i)).toBeInTheDocument();
   });
 });

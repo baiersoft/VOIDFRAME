@@ -20,6 +20,8 @@ pub enum Module {
     LaunchArgs {
         args: String,
     },
+    CustomScript(CustomScriptPayload),
+    Cs2Config(Cs2ConfigPayload),
     Unsupported,
 }
 
@@ -49,14 +51,18 @@ enum KnownModule {
     LaunchArgs {
         args: String,
     },
+    CustomScript(CustomScriptPayload),
+    Cs2Config(Cs2ConfigPayload),
 }
 
-const KNOWN_MODULE_TYPES: [&str; 5] = [
+const KNOWN_MODULE_TYPES: [&str; 7] = [
     "registry",
     "powercfg",
     "power_plan",
     "affinity_cpu",
     "launch_args",
+    "custom_script",
+    "cs2_config",
 ];
 
 impl<'de> Deserialize<'de> for Module {
@@ -86,6 +92,8 @@ impl<'de> Deserialize<'de> for Module {
             KnownModule::PowerPlan(p) => Module::PowerPlan(p),
             KnownModule::AffinityCpu(p) => Module::AffinityCpu(p),
             KnownModule::LaunchArgs { args } => Module::LaunchArgs { args },
+            KnownModule::CustomScript(p) => Module::CustomScript(p),
+            KnownModule::Cs2Config(p) => Module::Cs2Config(p),
         })
     }
 }
@@ -103,6 +111,12 @@ pub struct RegistryPayload {
     /// same specta-typescript escape hatch as `CatalogEntry.module_template`.
     #[cfg_attr(feature = "specta", specta(type = specta_typescript::Unknown))]
     pub value: serde_json::Value,
+    /// The value only takes effect after a reboot (HAGS, `MSISupported`, …).
+    /// A scenario containing any such module is a reboot scenario
+    /// (`Scenario::requires_reboot`), which drives the run loop's
+    /// `plan_transition` and the builder's reboot count.
+    #[serde(default)]
+    pub requires_reboot: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +173,22 @@ pub struct AffinityCpuPayload {
     pub mask_hex: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct CustomScriptPayload {
+    pub apply_script: String,
+    pub revert_script: String,
+    #[serde(default)]
+    pub requires_reboot: bool,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct Cs2ConfigPayload {
+    pub settings: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
@@ -198,6 +228,69 @@ fn validate_registry_component(s: &str, field: &str, reject_dotdot_segments: boo
     Ok(())
 }
 
+/// `docs/superpowers/specs/2026-09-08-custom-script-cs2-config-design.md`
+/// §3.1: both paths must resolve strictly inside the project's own
+/// `scripts/` directory once normalized -- no `..` segments, no absolute
+/// paths, and an allowed extension. Deserialize-boundary rejection, same
+/// posture as `validate_registry_component` for registry paths.
+///
+/// A `custom_script` path must in fact be a single *flat filename*, not
+/// merely a relative one: `copy_dir_flat` (`journal::restore_script`) only
+/// ever copies `scripts/`'s own files, never subdirectories (spec §3.1), so
+/// any path separator here can only mean either a traversal attempt or a
+/// subdirectory reference this system has no support for either way -- both
+/// rejected the same way, by excluding path separators from the allowed
+/// character set entirely (Finding 9 of the 2026-09-08 final review).
+fn validate_script_path(p: &str, field: &str) -> Result<()> {
+    if p.contains('\0') {
+        return Err(Error::msg(format!(
+            "custom_script {field} must not contain a NUL byte"
+        )));
+    }
+    // Additive to the `..`/extension checks below: a legal NTFS filename
+    // can contain shell metacharacters (`&`, `|`, `%`, `^`, `<`, `>`,
+    // quotes, ...) that those checks don't cover, and this value is later
+    // interpolated unescaped into a `call "...\{path}"` line in
+    // `VOIDFRAME_RESTORE.bat` (see `journal::restore_script`) -- an
+    // artifact a user is meant to trust and double-click during an
+    // emergency. Restrict to a safe character set instead of trying to
+    // enumerate every dangerous one; `\` and `/` are excluded here too
+    // (not just handled via a components check below), which also makes an
+    // absolute or drive-relative path (`C:\...`, `\Windows\...`)
+    // impossible to express in the first place.
+    if !p
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(Error::msg(format!(
+            "custom_script {field} must be a flat filename containing only letters, digits, `_`, `-`, or `.` (no path separators), got {p:?}"
+        )));
+    }
+    // Checked on the raw string, not via `std::path::Path::components()`
+    // (which only treats `\` as a separator on Windows -- this crate is
+    // meant to compile off-Windows too, so a components-based check would
+    // behave inconsistently by host OS). With no separator characters
+    // allowed at all (above), this can only ever match a path that is
+    // *exactly* `..`, but the check is kept explicit so the intent stays
+    // clear and correct even if the allowlist above is ever loosened.
+    if p.split(['\\', '/']).any(|seg| seg == "..") {
+        return Err(Error::msg(format!(
+            "custom_script {field} must not contain a `..` segment, got {p:?}"
+        )));
+    }
+    let ext = std::path::Path::new(p)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "bat" | "cmd" | "ps1") {
+        return Err(Error::msg(format!(
+            "custom_script {field} must end in .bat, .cmd, or .ps1, got {p:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl Module {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -206,7 +299,22 @@ impl Module {
             Module::PowerPlan(_) => "power_plan",
             Module::AffinityCpu(_) => "affinity_cpu",
             Module::LaunchArgs { .. } => "launch_args",
+            Module::CustomScript(_) => "custom_script",
+            Module::Cs2Config(_) => "cs2_config",
             Module::Unsupported => "unsupported",
+        }
+    }
+
+    pub fn requires_reboot(&self) -> bool {
+        match self {
+            Module::Registry(p) => p.requires_reboot,
+            Module::CustomScript(p) => p.requires_reboot,
+            Module::Powercfg { .. }
+            | Module::PowerPlan(_)
+            | Module::AffinityCpu(_)
+            | Module::LaunchArgs { .. }
+            | Module::Cs2Config(_)
+            | Module::Unsupported => false,
         }
     }
 
@@ -247,10 +355,16 @@ impl Module {
                 }
                 Ok(())
             }
+            Module::CustomScript(p) => {
+                validate_script_path(&p.apply_script, "apply_script")?;
+                validate_script_path(&p.revert_script, "revert_script")?;
+                Ok(())
+            }
             Module::Powercfg { .. }
             | Module::PowerPlan(_)
             | Module::AffinityCpu(_)
-            | Module::LaunchArgs { .. } => Ok(()),
+            | Module::LaunchArgs { .. }
+            | Module::Cs2Config(_) => Ok(()),
         }
     }
 
@@ -409,6 +523,10 @@ mod tests {
             parse(r#"{"type":"power_plan","plan_guid":"8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"}"#),
             parse(r#"{"type":"affinity_cpu","mode":"exclude_core0"}"#),
             parse(r#"{"type":"launch_args","args":"-novid"}"#),
+            parse(
+                r#"{"type":"custom_script","apply_script":"disable-thing.ps1","revert_script":"enable-thing.ps1","requires_reboot":false,"description":"toggles a thing"}"#,
+            ),
+            parse(r#"{"type":"cs2_config","settings":{"setting.fullscreen":"0"}}"#),
         ];
         for m in modules {
             let json = serde_json::to_string(&m).unwrap();
@@ -446,6 +564,7 @@ mod tests {
                 value_name: "HwSchMode".into(),
                 value_type: RegType::Dword,
                 value: serde_json::json!(2),
+                requires_reboot: false,
             }),
             Module::Powercfg {
                 sub: "sub_processor".into(),
@@ -464,6 +583,18 @@ mod tests {
             Module::LaunchArgs {
                 args: "-novid -high".into(),
             },
+            Module::CustomScript(CustomScriptPayload {
+                apply_script: "disable-thing.ps1".into(),
+                revert_script: "enable-thing.ps1".into(),
+                requires_reboot: false,
+                description: "toggles a thing".into(),
+            }),
+            Module::Cs2Config(Cs2ConfigPayload {
+                settings: std::collections::BTreeMap::from([(
+                    "setting.fullscreen".to_string(),
+                    "0".to_string(),
+                )]),
+            }),
             Module::Unsupported,
         ];
         let fresh = serde_json::to_string_pretty(&modules).unwrap() + "\n";
@@ -476,5 +607,144 @@ mod tests {
             "fixture missing -- run: $env:VOIDFRAME_WRITE_FIXTURES=1; cargo test -p voidframe-engine module_wire_fixture",
         );
         assert_eq!(fresh.replace("\r\n", "\n"), committed.replace("\r\n", "\n"));
+    }
+
+    #[test]
+    fn registry_requires_reboot_defaults_false_and_round_trips() {
+        let m = parse(
+            r#"{"type":"registry","hive":"HKLM","subkey":"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers","value_name":"HwSchMode","value_type":"DWORD","value":2}"#,
+        );
+        assert!(!m.requires_reboot());
+        let m = parse(
+            r#"{"type":"registry","hive":"HKLM","subkey":"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers","value_name":"HwSchMode","value_type":"DWORD","value":2,"requires_reboot":true}"#,
+        );
+        assert!(m.requires_reboot());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"requires_reboot\":true"));
+    }
+
+    #[test]
+    fn non_registry_modules_never_require_a_reboot() {
+        let m =
+            parse(r#"{"type":"powercfg","sub":"sub_processor","setting":"IDLEDISABLE","value":1}"#);
+        assert!(!m.requires_reboot());
+        let m = parse(r#"{"type":"launch_args","args":"-novid"}"#);
+        assert!(!m.requires_reboot());
+    }
+
+    #[test]
+    fn parses_custom_script_module() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"disable-thing.ps1","revert_script":"enable-thing.ps1","requires_reboot":false,"description":"toggles a thing"}"#,
+        );
+        assert_eq!(m.kind(), "custom_script");
+        m.require_m1_supported().unwrap();
+    }
+
+    #[test]
+    fn custom_script_rejects_a_path_outside_scripts_dir() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"..\\..\\evil.bat","revert_script":"revert.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    #[test]
+    fn custom_script_rejects_an_absolute_path() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"C:\\Windows\\System32\\evil.bat","revert_script":"revert.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    #[test]
+    fn custom_script_rejects_an_unlisted_extension() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"apply.exe","revert_script":"revert.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    #[test]
+    fn custom_script_accepts_bat_cmd_and_ps1() {
+        for ext in ["bat", "cmd", "ps1"] {
+            let m = parse(&format!(
+                r#"{{"type":"custom_script","apply_script":"apply.{ext}","revert_script":"revert.{ext}","requires_reboot":false,"description":"d"}}"#
+            ));
+            m.require_m1_supported().unwrap();
+        }
+    }
+
+    #[test]
+    fn custom_script_requires_reboot_reflects_its_own_flag() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"a.bat","revert_script":"r.bat","requires_reboot":true,"description":"d"}"#,
+        );
+        assert!(m.requires_reboot());
+    }
+
+    /// Finding 9: a subdirectory reference with no `..` traversal at all
+    /// must still be rejected -- `custom_script` paths are single flat
+    /// filenames only (`copy_dir_flat` never copies subdirectories).
+    #[test]
+    fn custom_script_rejects_a_subdirectory_path_with_no_traversal() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"subdir\\apply.bat","revert_script":"revert.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    /// Same as above, forward-slash form.
+    #[test]
+    fn custom_script_rejects_a_forward_slash_subdirectory_path() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"subdir/apply.bat","revert_script":"revert.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    #[test]
+    fn custom_script_rejects_a_root_relative_path() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"\\Windows\\evil.bat","revert_script":"revert.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    #[test]
+    fn custom_script_accepts_uppercase_extension() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"apply.BAT","revert_script":"revert.PS1","requires_reboot":false,"description":"d"}"#,
+        );
+        m.require_m1_supported().unwrap();
+    }
+
+    #[test]
+    fn custom_script_rejects_extension_only_path() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":".bat","revert_script":"revert.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    /// A `&` is a legal NTFS filename character but a cmd.exe command
+    /// separator; unescaped, it would break out of the quoted `call "..."`
+    /// context in `VOIDFRAME_RESTORE.bat`. Neither the `..`/absolute-path
+    /// check nor the extension check catches this -- only the character
+    /// allowlist does.
+    #[test]
+    fn custom_script_rejects_a_shell_metacharacter_in_the_path() {
+        let m = parse(
+            r#"{"type":"custom_script","apply_script":"apply.bat","revert_script":"evil & calc.exe.bat","requires_reboot":false,"description":"d"}"#,
+        );
+        assert!(m.require_m1_supported().is_err());
+    }
+
+    #[test]
+    fn parses_cs2_config_module() {
+        let m = parse(r#"{"type":"cs2_config","settings":{"setting.fullscreen":"0"}}"#);
+        assert_eq!(m.kind(), "cs2_config");
+        assert!(!m.requires_reboot());
+        m.require_m1_supported().unwrap();
     }
 }

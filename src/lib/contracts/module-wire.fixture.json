@@ -5,7 +5,8 @@
     "subkey": "SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
     "value_name": "HwSchMode",
     "value_type": "DWORD",
-    "value": 2
+    "value": 2,
+    "requires_reboot": false
   },
   {
     "type": "powercfg",
@@ -27,6 +28,19 @@
   {
     "type": "launch_args",
     "args": "-novid -high"
+  },
+  {
+    "type": "custom_script",
+    "apply_script": "disable-thing.ps1",
+    "revert_script": "enable-thing.ps1",
+    "requires_reboot": false,
+    "description": "toggles a thing"
+  },
+  {
+    "type": "cs2_config",
+    "settings": {
+      "setting.fullscreen": "0"
+    }
   },
   {
     "type": "unsupported"

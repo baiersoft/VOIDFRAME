@@ -30,6 +30,15 @@ pub struct CatalogEntry {
     /// variant, which nothing in this crate's own types can fix directly).
     #[cfg_attr(feature = "specta", specta(type = specta_typescript::Unknown))]
     pub module_template: serde_json::Value,
+    /// The alternate value for a binary registry toggle (e.g. HAGS's
+    /// `HwSchMode`) -- lets the picker offer whichever direction the live
+    /// machine isn't already at, instead of blocking as a no-op with no
+    /// fallback. `None` for every entry that isn't a two-state toggle.
+    /// Deliberately NOT part of `module_template` -- this is catalog
+    /// metadata for the picker UI, never a field of the `Module` itself.
+    #[serde(default)]
+    #[cfg_attr(feature = "specta", specta(type = specta_typescript::Unknown))]
+    pub off_value: Option<serde_json::Value>,
     /// `true` if a scenario may contain at most one module of this entry's
     /// `kind` (e.g. `power_plan` -- a scenario targets exactly one power
     /// plan, so a second one is never meaningful). Enforced by
@@ -37,6 +46,24 @@ pub struct CatalogEntry {
     /// already-shipped catalog entry needs no change.
     #[serde(default)]
     pub singleton: bool,
+    /// Named value choices for a registry entry with more than two
+    /// meaningful states (e.g. `Win32PrioritySeparation`'s twelve
+    /// interval/length/PsPrioSep combinations) -- the picker offers these
+    /// as a dropdown instead of `off_value`'s single-click toggle, and
+    /// disables whichever choice matches the machine's live value. `None`
+    /// for every entry that isn't a multi-value picker.
+    #[serde(default)]
+    pub value_choices: Option<Vec<CatalogValueChoice>>,
+}
+
+/// One dropdown option for `CatalogEntry::value_choices`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct CatalogValueChoice {
+    pub label: String,
+    /// Same BigInt-export caveat as `CatalogEntry::module_template`.
+    #[cfg_attr(feature = "specta", specta(type = specta_typescript::Unknown))]
+    pub value: serde_json::Value,
 }
 
 /// Compile-time-embedded fallback, same reasoning as
@@ -57,7 +84,11 @@ mod tests {
     fn embedded_seed_parses_and_is_non_empty() {
         let entries = load_catalog().unwrap();
         assert!(!entries.is_empty());
-        assert!(entries.iter().all(|e| e.available_in == "M1"));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.available_in == "M1" || e.available_in == "M3")
+        );
     }
 
     #[test]
@@ -68,6 +99,8 @@ mod tests {
             "power_plan",
             "affinity_cpu",
             "launch_args",
+            "cs2_config",
+            "custom_script",
         ];
         for e in load_catalog().unwrap() {
             assert!(
@@ -112,6 +145,22 @@ mod tests {
     }
 
     #[test]
+    fn hags_catalog_entry_has_off_value_and_others_do_not() {
+        let entries = load_catalog().unwrap();
+        let hags = entries
+            .iter()
+            .find(|e| e.id == "hags")
+            .expect("catalog should have a hags entry");
+        assert_eq!(hags.off_value, Some(serde_json::json!(1)));
+
+        let power_plan = entries
+            .iter()
+            .find(|e| e.kind == "power_plan")
+            .expect("catalog should have a power_plan entry");
+        assert_eq!(power_plan.off_value, None);
+    }
+
+    #[test]
     fn launch_args_catalog_entry_is_marked_singleton() {
         let entries = load_catalog().unwrap();
         let launch_args = entries
@@ -122,5 +171,30 @@ mod tests {
             launch_args.singleton,
             "a scenario edits one free-text launch-options field, not several"
         );
+    }
+
+    #[test]
+    fn value_choices_field_defaults_to_none_when_absent_from_json() {
+        let e: CatalogEntry = serde_json::from_str(
+            r#"{"id":"x","name":"X","category":"cpu","kind":"powercfg","description":"d","available_in":"M1","module_template":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(e.value_choices, None);
+    }
+
+    #[test]
+    fn win32_priority_separation_catalog_entry_has_twelve_value_choices() {
+        let entries = load_catalog().unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.id == "win32-priority-separation")
+            .expect("catalog should have a win32-priority-separation entry");
+        let choices = entry
+            .value_choices
+            .as_ref()
+            .expect("win32-priority-separation should have value_choices");
+        assert_eq!(choices.len(), 12);
+        assert!(choices.iter().any(|c| c.value == serde_json::json!(38)));
+        assert_eq!(entry.off_value, None);
     }
 }

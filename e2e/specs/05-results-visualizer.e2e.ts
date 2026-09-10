@@ -62,4 +62,24 @@ describe("Results Visualizer — real seeded run data, no benchmark required", (
     await $("button=Markdown Table").click();
     await expectBodyContains("Copied Markdown");
   });
+
+  // wdio.conf.ts's seedFixtures also derives a second, older run for this
+  // same project (same project_id, trimmed to baseline + one non-winning
+  // scenario) specifically so this run-switcher dropdown (ResultsVisualizer's
+  // `runHistory` prop) has a genuinely different run to switch to.
+  it("switches to the seeded older run via the run-switcher dropdown, and back", async () => {
+    await $("button*=RUN").click();
+    // The older run's row: no winner, so it renders its scenario count
+    // instead ("baseline" + the one carried-over scenario).
+    await (await $("button*=2 scenarios")).click();
+    await expectBodyContains("Control 1 (No-Op)");
+    const bodyText = await (await $("body")).getText();
+    expect(bodyText).not.toContain("Power Saver #1");
+
+    // Switch back to the newest run via its own row (the only one with a
+    // "Winner:" line) and confirm the full scenario set is back.
+    await $("button*=RUN").click();
+    await (await $("button*=Winner:")).click();
+    await expectBodyContains("Power Saver #1");
+  });
 });

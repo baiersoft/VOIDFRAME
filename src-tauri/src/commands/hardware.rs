@@ -45,9 +45,11 @@ mod tests {
     #[tokio::test]
     async fn cpu_model_reads_the_processor_name_string_value() {
         let sys = MockController::new().with_registry(
-            voidframe_engine::model::module::Hive::Hklm,
-            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
-            "ProcessorNameString",
+            &voidframe_engine::system::RegKey {
+                hive: voidframe_engine::model::module::Hive::Hklm,
+                subkey: r"HARDWARE\DESCRIPTION\System\CentralProcessor\0".into(),
+                value_name: "ProcessorNameString".into(),
+            },
             voidframe_engine::system::RegValue::Sz("AMD Ryzen 7 9800X3D 8-Core Processor".into()),
         );
         let model = cpu_model_impl(&sys).await.unwrap();

@@ -8,6 +8,9 @@
 //! synchronous Win32 APIs with no async variant.
 
 mod affinity;
+mod bitlocker;
+mod boot_report;
+mod console_text;
 mod deelevate;
 mod dxgi;
 mod hwinfo;
@@ -16,6 +19,10 @@ mod power_plan;
 mod powercfg;
 mod process;
 mod registry;
+mod run_script;
+mod scheduled_task;
+mod shutdown;
+mod sleep;
 mod steam;
 mod topology;
 pub(crate) mod vdf;
@@ -62,6 +69,32 @@ impl SystemController for WindowsController {
         powercfg::write(sub, setting, v).await
     }
 
+    async fn find_cs2_video_config_path(&self) -> Result<std::path::PathBuf> {
+        let steam_path = self.steam_install_path().await?;
+        tokio::task::spawn_blocking(move || vdf::find_cs2_video_config(&steam_path))
+            .await
+            .map_err(|e| Error::msg(format!("find_cs2_video_config_path task join error: {e}")))?
+    }
+    async fn read_cs2_video_config(&self) -> Result<String> {
+        let path = self.find_cs2_video_config_path().await?;
+        tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| Error::msg(format!("failed to read {}: {e}", path.display())))
+    }
+    async fn write_cs2_video_config(&self, text: &str) -> Result<()> {
+        let path = self.find_cs2_video_config_path().await?;
+        tokio::fs::write(&path, text)
+            .await
+            .map_err(|e| Error::msg(format!("failed to write {}: {e}", path.display())))
+    }
+
+    async fn run_script(
+        &self,
+        path: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> Result<ScriptOutput> {
+        run_script::run(path, timeout).await
+    }
     async fn list_power_plans(&self) -> Result<Vec<PowerPlan>> {
         power_plan::list().await
     }
@@ -173,8 +206,8 @@ impl SystemController for WindowsController {
         deelevate::launch(program, args).await
     }
 
-    async fn reissue_map(&self, map_command: &str) -> Result<()> {
-        input::reissue_map(map_command).await
+    async fn send_console_command(&self, command: &str) -> Result<()> {
+        input::send_console_command(command).await
     }
     async fn hide_console(&self) -> Result<()> {
         input::hide_console().await
@@ -200,5 +233,34 @@ impl SystemController for WindowsController {
     }
     async fn read_hwinfo_sensors(&self) -> Result<HwinfoSensorSnapshot> {
         hwinfo::read_sensors().await
+    }
+
+    async fn reboot(&self, delay_secs: u32, message: &str) -> Result<()> {
+        shutdown::reboot(delay_secs, message).await
+    }
+    async fn shutdown(&self, delay_secs: u32, message: &str) -> Result<()> {
+        shutdown::shutdown(delay_secs, message).await
+    }
+    async fn cancel_shutdown(&self) -> Result<()> {
+        shutdown::cancel().await
+    }
+    async fn register_task(&self, spec: &TaskSpec) -> Result<()> {
+        scheduled_task::register(spec).await
+    }
+    async fn deregister_task(&self, name: &str) -> Result<()> {
+        scheduled_task::deregister(name).await
+    }
+    async fn task_exists(&self, name: &str) -> Result<bool> {
+        scheduled_task::exists(name).await
+    }
+
+    async fn boot_report(&self, since: std::time::SystemTime) -> Result<BootReport> {
+        boot_report::report(since).await
+    }
+    async fn bitlocker_protection(&self) -> Result<BitlockerStatus> {
+        bitlocker::protection_status().await
+    }
+    async fn inhibit_sleep(&self, on: bool) -> Result<()> {
+        sleep::inhibit(on).await
     }
 }

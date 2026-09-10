@@ -1,15 +1,19 @@
 pub mod catalog;
 pub mod config;
+pub mod cs2_config;
+pub mod custom_script;
 pub mod hardware;
 pub mod launch_args;
 pub mod power_plan;
 pub mod preflight;
 pub mod projects;
+pub mod registry;
 pub mod results;
 pub mod rollback;
 pub mod run;
 pub mod run_store;
 pub mod shell;
+pub mod shutdown;
 
 /// Turns a `spawn_blocking` `JoinError` (a panic on the blocking task) into
 /// this crate's own `Result<T, String>` error shape -- the wording mirrors

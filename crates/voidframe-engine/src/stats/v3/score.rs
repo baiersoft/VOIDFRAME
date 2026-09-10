@@ -46,17 +46,41 @@ impl Default for WcpsV3Weights {
     }
 }
 
-/// `(value - baseline_mean) / baseline_stddev`, sigma floored, sign-flipped
-/// when `lower_is_better` -- identical formula to `stats::wcps::z_score`,
-/// see this module's doc comment for why it's duplicated, not imported.
-fn z_score(value: f64, baseline_values: &[f64], lower_is_better: bool) -> f64 {
+/// `(value - baseline_mean) / baseline_stddev`, sign-flipped when
+/// `lower_is_better` -- `None` when the baseline metric has (effectively)
+/// zero variance across its measure iterations. Z-scoring against a
+/// near-zero spread would otherwise require dividing by an arbitrary floor,
+/// letting one degenerate metric's contribution swamp the other 5 by many
+/// orders of magnitude and potentially flip the sign of the entire score
+/// (confirmed on real data: study/pamuk/ab-test-analysis-report.md §2).
+/// `compute_wcps_v3` treats `None` as "no signal from this metric" and
+/// excludes it from the weighted sum entirely, rather than substituting an
+/// arbitrarily large or sign-flippable number.
+fn z_score(value: f64, baseline_values: &[f64], lower_is_better: bool) -> Option<f64> {
     let mu = mean(baseline_values);
-    let mut sigma = stddev_sample(baseline_values);
+    let sigma = stddev_sample(baseline_values);
     if sigma.abs() < SIGMA_FLOOR {
-        sigma = SIGMA_FLOOR;
+        return None;
     }
     let z = (value - mu) / sigma;
-    if lower_is_better { -z } else { z }
+    Some(if lower_is_better { -z } else { z })
+}
+
+/// `true` if any of the 6 metrics' baseline values have (effectively) zero
+/// variance -- i.e. `compute_wcps_v3` would exclude at least one of them
+/// from its weighted sum via `z_score`'s `None` branch. `evaluate_verdict`
+/// (`stats/v3/verdict.rs`) uses this to avoid trusting the score's sign for
+/// `Better`/`Worse` direction when the metric driving Hotelling's
+/// `Different` flag might be exactly the one the score had to exclude --
+/// confirmed as a real failure mode on `study/pamuk/d38e6455-.../results.json`
+/// (see this project's whole-branch final review for the exact numbers).
+pub fn any_metric_baseline_degenerate(
+    throughput_baseline: &[[f64; 4]],
+    pacing_baseline: &[[f64; 2]],
+) -> bool {
+    let is_degenerate = |vals: Vec<f64>| stddev_sample(&vals).abs() < SIGMA_FLOOR;
+    (0..4).any(|i| is_degenerate(throughput_baseline.iter().map(|row| row[i]).collect()))
+        || (0..2).any(|i| is_degenerate(pacing_baseline.iter().map(|row| row[i]).collect()))
 }
 
 /// Scores a scenario's aggregated (mean) throughput/pacing values against
@@ -70,6 +94,16 @@ fn z_score(value: f64, baseline_values: &[f64], lower_is_better: bool) -> f64 {
 /// established convention: `throughput_*` is
 /// `[avg_fps, p1_fps, p01_fps, adaptive_frame_time_cv]`, `pacing_*` is
 /// `[stutter_count_pct, mean_abs_animation_error_ms]`.
+///
+/// NOTE: when one or more metrics are excluded from the sum (see
+/// `z_score`'s `None` branch above), the score's magnitude sits on a
+/// smaller effective scale than a scenario where every metric contributed
+/// -- `RunResults::summarize()`'s cross-run "best WCPS" comparison
+/// (surfaced in the dashboard's project-level "BEST WCPS" tile) is
+/// therefore biased toward runs where no metric happened to be excluded.
+/// Not worth correcting the design over, but worth knowing when comparing
+/// `wcps` values ACROSS runs, not just within one run's own baseline
+/// comparison.
 pub fn compute_wcps_v3(
     throughput_baseline: &[[f64; 4]],
     pacing_baseline: &[[f64; 2]],
@@ -98,21 +132,23 @@ pub fn compute_wcps_v3(
     let mut score = 0.0;
     for i in 0..4 {
         let baseline_vals: Vec<f64> = throughput_baseline.iter().map(|row| row[i]).collect();
-        score += throughput_weights[i]
-            * z_score(
-                throughput_scenario_mean[i],
-                &baseline_vals,
-                throughput_lower_is_better[i],
-            );
+        if let Some(z) = z_score(
+            throughput_scenario_mean[i],
+            &baseline_vals,
+            throughput_lower_is_better[i],
+        ) {
+            score += throughput_weights[i] * z;
+        }
     }
     for i in 0..2 {
         let baseline_vals: Vec<f64> = pacing_baseline.iter().map(|row| row[i]).collect();
-        score += pacing_weights[i]
-            * z_score(
-                pacing_scenario_mean[i],
-                &baseline_vals,
-                pacing_lower_is_better[i],
-            );
+        if let Some(z) = z_score(
+            pacing_scenario_mean[i],
+            &baseline_vals,
+            pacing_lower_is_better[i],
+        ) {
+            score += pacing_weights[i] * z;
+        }
     }
     score
 }
@@ -185,5 +221,52 @@ mod tests {
             &WcpsV3Weights::default(),
         );
         assert!(score < 0.0, "expected negative score, got {score}");
+    }
+
+    #[test]
+    fn zero_variance_baseline_metric_contributes_nothing_to_the_score() {
+        // Reproduces study/pamuk/.../d38e6455.../results.json's real
+        // stutter_count_pct shape: baseline exactly 0.0 in every iteration
+        // (a legitimate outcome for a very stable capture -- see
+        // study/pamuk/ab-test-analysis-report.md §2.1) -- must not blow up
+        // the score just because the scenario's own value is nonzero.
+        let throughput_baseline = vec![[400.0, 250.0, 180.0, 0.10]; 3];
+        let pacing_baseline = vec![[0.0, 0.22]; 3]; // stutter_count_pct always exactly 0.0
+        let score = compute_wcps_v3(
+            &throughput_baseline,
+            &pacing_baseline,
+            [400.0, 250.0, 180.0, 0.10],
+            [0.36, 0.22], // scenario stutter_count_pct = 0.36%, everything else matches baseline
+            &WcpsV3Weights::default(),
+        );
+        assert!(
+            score.abs() < 1e-6,
+            "a zero-variance baseline metric must contribute 0 to the score regardless of the \
+             scenario's own value, got {score}"
+        );
+    }
+
+    #[test]
+    fn any_metric_baseline_degenerate_detects_a_single_zero_variance_column() {
+        let throughput_baseline = vec![[400.0, 250.0, 180.0, 0.10]; 3]; // all zero-variance
+        let pacing_baseline = vec![[7.2, 0.24], [7.0, 0.22], [6.8, 0.20]]; // real variance
+        assert!(any_metric_baseline_degenerate(
+            &throughput_baseline,
+            &pacing_baseline
+        ));
+    }
+
+    #[test]
+    fn any_metric_baseline_degenerate_is_false_when_every_metric_has_real_variance() {
+        let throughput_baseline = vec![
+            [390.0, 240.0, 170.0, 0.12],
+            [400.0, 250.0, 180.0, 0.10],
+            [410.0, 260.0, 190.0, 0.08],
+        ];
+        let pacing_baseline = vec![[7.2, 0.24], [7.0, 0.22], [6.8, 0.20]];
+        assert!(!any_metric_baseline_degenerate(
+            &throughput_baseline,
+            &pacing_baseline
+        ));
     }
 }

@@ -3,6 +3,8 @@
 //! `SystemController`.
 
 pub mod affinity_cpu;
+pub mod cs2_config;
+pub mod custom_script;
 pub mod power_plan;
 pub mod powercfg;
 pub mod registry;
@@ -55,11 +57,21 @@ pub fn conflict_check(modules: &[Module]) -> Result<()> {
 /// `AffinityCpu` / `LaunchArgs` are no-ops here — they take effect at CS2
 /// launch (`docs/superpowers/plans/2026-09-01-m1-phase-3b-cs2-control-run-loop.md`),
 /// not as a persisted system mutation.
+///
+/// `no_return` is the run's "point of no return" shield
+/// (`run::execute::context::RunContext::no_return`), forwarded only to
+/// [`power_plan::apply`] -- the one apply path whose OS call resolves
+/// *before* its journal record can exist, so it needs the cancellation
+/// window around that call closed. The Registry/Powercfg arms journal
+/// before they apply and need no shield. Callers with no live run to
+/// shield (dry-run, replay, tests) pass a throwaway channel's sender.
 pub async fn apply_module(
     m: &Module,
+    project_dir: &Path,
     sys: &dyn SystemController,
     journal: &mut Journal,
     ctx: &MutationCtx,
+    no_return: &tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     match m {
         Module::Registry(p) => registry::apply(p, sys, journal, ctx).await,
@@ -68,7 +80,9 @@ pub async fn apply_module(
             setting,
             value,
         } => powercfg::apply(sub, setting, *value, sys, journal, ctx).await,
-        Module::PowerPlan(p) => power_plan::apply(p, sys, journal, ctx).await,
+        Module::PowerPlan(p) => power_plan::apply(p, sys, journal, ctx, no_return).await,
+        Module::CustomScript(p) => custom_script::apply(p, project_dir, sys, journal, ctx).await,
+        Module::Cs2Config(p) => cs2_config::apply(p, sys, journal, ctx).await,
         Module::AffinityCpu(_) | Module::LaunchArgs { .. } => Ok(()),
         Module::Unsupported => Err(Error::unsupported_module(
             "unsupported".into(),
@@ -80,6 +94,7 @@ pub async fn apply_module(
 /// Undo one journal record via the matching `SystemController` method.
 pub async fn revert_record(
     rec: &JournalRecord,
+    project_dir: &Path,
     sys: &dyn SystemController,
     ctx: &MutationCtx,
 ) -> Result<()> {
@@ -89,6 +104,8 @@ pub async fn revert_record(
         Op::PowerPlanActivate | Op::PowerPlanCreate | Op::PowerPlanDelete => {
             power_plan::revert(rec, sys, ctx).await
         }
+        Op::CustomScriptApply => custom_script::revert(rec, project_dir, sys, ctx).await,
+        Op::Cs2ConfigApply => cs2_config::revert(rec, sys, ctx).await,
     }
 }
 
@@ -98,8 +115,10 @@ pub async fn revert_record(
 pub async fn apply_scenario(
     sc: &Scenario,
     run_id: &str,
+    project_dir: &Path,
     sys: &dyn SystemController,
     journal: &mut Journal,
+    no_return: &tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
     conflict_check(&sc.modules)?;
     for (i, m) in sc.modules.iter().enumerate() {
@@ -109,7 +128,7 @@ pub async fn apply_scenario(
             scenario_id: sc.id.clone(),
             step_index: i as u32,
         };
-        apply_module(m, sys, journal, &ctx).await?;
+        apply_module(m, project_dir, sys, journal, &ctx, no_return).await?;
     }
     Ok(())
 }
@@ -123,10 +142,11 @@ pub async fn apply_scenario(
 /// call-site-transparent.
 pub async fn revert_scenario(
     _scenario_id: &str,
+    project_dir: &Path,
     journal_path: &Path,
     sys: &dyn SystemController,
 ) -> Result<RevertReport> {
-    revert_all(journal_path, sys).await
+    revert_all(project_dir, journal_path, sys).await
 }
 
 #[cfg(test)]
@@ -149,6 +169,7 @@ mod conflict_check_singleton_tests {
             value_name: "HwSchMode".into(),
             value_type: RegType::Dword,
             value: serde_json::json!(2),
+            requires_reboot: false,
         })
     }
 

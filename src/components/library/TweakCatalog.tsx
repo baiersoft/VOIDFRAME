@@ -1,9 +1,54 @@
 import React, { useEffect, useState } from "react";
 import { Search, Plus, X, Check, Layers, Filter } from "lucide-react";
-import { listCatalogTweaks, readCs2LaunchOptions } from "../../lib/api";
-import type { CatalogEntry, Module, PowerPlan } from "../../lib/bindings";
+import {
+  getConfig,
+  listCatalogTweaks,
+  readCs2LaunchOptions,
+  readCs2VideoConfig,
+  readRegistryValue,
+  saveConfig,
+} from "../../lib/api";
+import type {
+  CatalogEntry,
+  CatalogValueChoice,
+  Hive,
+  Module,
+  PowerPlan,
+  RegistryValueView,
+} from "../../lib/bindings";
 import { PowerPlanPicker } from "./PowerPlanPicker";
+import { RegistryValuePicker } from "./RegistryValuePicker";
 import { LaunchArgsEditor } from "./LaunchArgsEditor";
+import { Cs2ConfigEditor } from "./Cs2ConfigEditor";
+import { CustomScriptEditor } from "./CustomScriptEditor";
+import { CustomScriptWarningModal } from "../modals/CustomScriptWarningModal";
+
+/** Narrows a catalog entry's untyped `module_template` down to the fields a
+ * `registry`-kind entry needs for a live read -- same "cast after a runtime
+ * shape check" pattern `handleAdd` below already uses for the full `Module`
+ * cast, just narrower. */
+function asRegistryTemplate(
+  template: unknown
+): { hive: Hive; subkey: string; value_name: string; value: unknown } | null {
+  if (template === null || typeof template !== "object") return null;
+  const t = template as Record<string, unknown>;
+  if (
+    typeof t.hive === "string" &&
+    typeof t.subkey === "string" &&
+    typeof t.value_name === "string" &&
+    "value" in t
+  ) {
+    return { hive: t.hive as Hive, subkey: t.subkey, value_name: t.value_name, value: t.value };
+  }
+  return null;
+}
+
+/** Pulls the raw value out of a `RegistryValueView.value` (`{type, value}`,
+ * untyped for the same reason the binding itself documents). */
+function liveRegistryValue(view: RegistryValueView): unknown {
+  if (view.value === null || typeof view.value !== "object") return undefined;
+  return (view.value as Record<string, unknown>).value;
+}
 
 interface TweakCatalogProps {
   isOpen: boolean;
@@ -16,6 +61,9 @@ interface TweakCatalogProps {
    * present there. */
   currentModules?: Module[];
   isModal?: boolean;
+  /** Current project's id -- needed by `CustomScriptEditor` to import
+   * browsed scripts into that project's own scripts directory. */
+  projectId: string;
 }
 
 export const TweakCatalog: React.FC<TweakCatalogProps> = ({
@@ -25,6 +73,7 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
   targetScenarioName,
   currentModules = [],
   isModal = true,
+  projectId,
 }) => {
   const [searchTerm, setSearchTerm] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
@@ -33,8 +82,29 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [addedIds, setAddedIds] = useState<Record<string, boolean>>({});
   const [pickingPowerPlanFor, setPickingPowerPlanFor] = useState<string | null>(null);
+  const [pickingRegistryChoiceFor, setPickingRegistryChoiceFor] = useState<string | null>(null);
   const [pickingLaunchArgsFor, setPickingLaunchArgsFor] = useState<string | null>(null);
   const [launchArgsInitialValue, setLaunchArgsInitialValue] = useState<string | null>(null);
+  const [pickingCs2ConfigFor, setPickingCs2ConfigFor] = useState<string | null>(null);
+  const [cs2ConfigInitialValue, setCs2ConfigInitialValue] = useState<Record<
+    string,
+    string
+  > | null>(null);
+  const [pickingCustomScriptFor, setPickingCustomScriptFor] = useState<string | null>(null);
+  // The one-time "custom scripts run elevated" warning -- shown before the
+  // very first custom_script add in an app installation, never per-script
+  // or per-run. Holds the entry id it's blocking so it can proceed straight
+  // to that entry's editor once acknowledged.
+  const [showingCustomScriptWarningFor, setShowingCustomScriptWarningFor] = useState<
+    string | null
+  >(null);
+  // Live registry reads for `kind === "registry"` entries (e.g. HAGS), keyed
+  // by `entry.id` -- powers the "currently ON -- this is your baseline" hint
+  // below. Best-effort: a failed read just means no hint, never an error
+  // banner for the whole catalog.
+  const [liveRegistryValues, setLiveRegistryValues] = useState<Map<string, RegistryValueView>>(
+    new Map()
+  );
 
   useEffect(() => {
     if (!isOpen) return;
@@ -45,6 +115,28 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setIsLoading(false));
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    entries
+      .filter((e) => e.kind === "registry")
+      .forEach((entry) => {
+        const template = asRegistryTemplate(entry.module_template);
+        if (!template) return;
+        readRegistryValue(template.hive, template.subkey, template.value_name)
+          .then((view) => {
+            if (cancelled) return;
+            setLiveRegistryValues((prev) => new Map(prev).set(entry.id, view));
+          })
+          .catch(() => {
+            // Best-effort -- see the state's own comment above.
+          });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, entries]);
 
   if (!isOpen) return null;
 
@@ -78,6 +170,47 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
         .catch(() => setLaunchArgsInitialValue(""));
       return;
     }
+    if (entry.kind === "cs2_config") {
+      setPickingCs2ConfigFor(entry.id);
+      setCs2ConfigInitialValue(null);
+      readCs2VideoConfig()
+        .then(setCs2ConfigInitialValue)
+        .catch(() => setCs2ConfigInitialValue({}));
+      return;
+    }
+    if (entry.kind === "custom_script") {
+      getConfig()
+        .then((config) => {
+          if (config.custom_script_warning_seen) {
+            setPickingCustomScriptFor(entry.id);
+          } else {
+            setShowingCustomScriptWarningFor(entry.id);
+          }
+        })
+        .catch(() => setPickingCustomScriptFor(entry.id));
+      return;
+    }
+    if (entry.kind === "registry" && entry.value_choices && entry.value_choices.length > 0) {
+      setPickingRegistryChoiceFor(entry.id);
+      return;
+    }
+    if (entry.kind === "registry" && entry.off_value !== undefined && entry.off_value !== null) {
+      const registryTemplate = asRegistryTemplate(entry.module_template);
+      const liveView = liveRegistryValues.get(entry.id);
+      const currentlyOn =
+        registryTemplate !== null &&
+        liveView !== undefined &&
+        liveView.present &&
+        liveRegistryValue(liveView) === registryTemplate.value;
+      if (currentlyOn) {
+        onSelectTweak({
+          ...(entry.module_template as Record<string, unknown>),
+          value: entry.off_value,
+        } as Module);
+        flashAdded(entry.id);
+        return;
+      }
+    }
     onSelectTweak(entry.module_template as Module);
     flashAdded(entry.id);
   };
@@ -94,12 +227,49 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
     flashAdded(entry.id);
   };
 
+  const handlePickRegistryChoice = (entry: CatalogEntry, choice: CatalogValueChoice) => {
+    if (!onSelectTweak) return;
+    onSelectTweak({
+      ...(entry.module_template as Record<string, unknown>),
+      value: choice.value,
+    } as Module);
+    setPickingRegistryChoiceFor(null);
+    flashAdded(entry.id);
+  };
+
   const handleSaveLaunchArgs = (entry: CatalogEntry, args: string) => {
     if (!onSelectTweak) return;
     onSelectTweak({ type: "launch_args", args });
     setPickingLaunchArgsFor(null);
     setLaunchArgsInitialValue(null);
     flashAdded(entry.id);
+  };
+
+  const handleSaveCs2Config = (entry: CatalogEntry, settings: Record<string, string>) => {
+    if (!onSelectTweak) return;
+    onSelectTweak({ type: "cs2_config", settings });
+    setPickingCs2ConfigFor(null);
+    setCs2ConfigInitialValue(null);
+    flashAdded(entry.id);
+  };
+
+  const handleSaveCustomScript = (entry: CatalogEntry, payload: Module) => {
+    if (!onSelectTweak) return;
+    onSelectTweak(payload);
+    setPickingCustomScriptFor(null);
+    flashAdded(entry.id);
+  };
+
+  const handleAcknowledgeCustomScriptWarning = async (entryId: string) => {
+    try {
+      const config = await getConfig();
+      await saveConfig({ ...config, custom_script_warning_seen: true });
+    } catch {
+      // Best-effort persistence -- the warning still proceeds to the editor
+      // either way; a failed save just means it may show again next time.
+    }
+    setShowingCustomScriptWarningFor(null);
+    setPickingCustomScriptFor(entryId);
   };
 
   const content = (
@@ -176,6 +346,20 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
           const isAdded = addedIds[entry.id];
           const alreadyPresent =
             entry.singleton && currentModules.some((m) => m.type === entry.kind);
+          const registryTemplate =
+            entry.kind === "registry" ? asRegistryTemplate(entry.module_template) : null;
+          const liveView = liveRegistryValues.get(entry.id);
+          const hasValueChoices = !!entry.value_choices && entry.value_choices.length > 0;
+          // Multi-choice entries (e.g. Win32PrioritySeparation) don't have a
+          // single "on" value to compare the live read against -- disabling
+          // per-choice happens inside RegistryValuePicker instead.
+          const currentlyOn =
+            !hasValueChoices &&
+            registryTemplate !== null &&
+            liveView !== undefined &&
+            liveView.present &&
+            liveRegistryValue(liveView) === registryTemplate.value;
+          const hasOffValue = entry.off_value !== undefined && entry.off_value !== null;
           return (
             <div key={entry.id} className="glass-card p-5 rounded-xl border-white/10 space-y-3">
               <div className="flex items-start justify-between gap-4">
@@ -192,12 +376,25 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
                   <p className="text-xs text-white/70 font-body leading-relaxed max-w-2xl">
                     {entry.description}
                   </p>
+                  {currentlyOn && (
+                    <p className="text-[10px] font-mono text-emerald-400">
+                      {hasOffValue
+                        ? "currently ON — Add will turn it OFF"
+                        : "currently ON — this is your baseline"}
+                    </p>
+                  )}
                 </div>
                 {onSelectTweak && (
                   <button
                     onClick={() => handleAdd(entry)}
-                    disabled={alreadyPresent}
-                    title={alreadyPresent ? "Already added to this scenario" : undefined}
+                    disabled={alreadyPresent || (currentlyOn && !hasOffValue)}
+                    title={
+                      currentlyOn && !hasOffValue
+                        ? "Already the machine's current value"
+                        : alreadyPresent
+                          ? "Already added to this scenario"
+                          : undefined
+                    }
                     className={`px-4 py-2 rounded-lg font-mono text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:cursor-not-allowed disabled:opacity-40 ${
                       isAdded
                         ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
@@ -221,6 +418,15 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
                   <PowerPlanPicker onSelect={(plan) => handlePickPowerPlan(entry, plan)} />
                 </div>
               )}
+              {pickingRegistryChoiceFor === entry.id && entry.value_choices && (
+                <div className="pt-2 border-t border-white/5">
+                  <RegistryValuePicker
+                    choices={entry.value_choices}
+                    currentValue={liveView?.present ? liveRegistryValue(liveView) : undefined}
+                    onSelect={(choice) => handlePickRegistryChoice(entry, choice)}
+                  />
+                </div>
+              )}
               {pickingLaunchArgsFor === entry.id && (
                 <div className="pt-2 border-t border-white/5">
                   {launchArgsInitialValue === null ? (
@@ -235,6 +441,29 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
                   )}
                 </div>
               )}
+              {pickingCs2ConfigFor === entry.id && (
+                <div className="pt-2 border-t border-white/5">
+                  {cs2ConfigInitialValue === null ? (
+                    <div className="text-xs font-mono text-white/50">
+                      Loading current video settings…
+                    </div>
+                  ) : (
+                    <Cs2ConfigEditor
+                      initialValue={cs2ConfigInitialValue}
+                      onSave={(settings) => handleSaveCs2Config(entry, settings)}
+                    />
+                  )}
+                </div>
+              )}
+              {pickingCustomScriptFor === entry.id && (
+                <div className="pt-2 border-t border-white/5">
+                  <CustomScriptEditor
+                    projectId={projectId}
+                    initialValue={null}
+                    onSave={(payload) => handleSaveCustomScript(entry, { type: "custom_script", ...payload })}
+                  />
+                </div>
+              )}
             </div>
           );
         })}
@@ -242,13 +471,28 @@ export const TweakCatalog: React.FC<TweakCatalogProps> = ({
     </div>
   );
 
+  const warningModal = showingCustomScriptWarningFor !== null && (
+    <CustomScriptWarningModal
+      onAcknowledge={() => handleAcknowledgeCustomScriptWarning(showingCustomScriptWarningFor)}
+      onCancel={() => setShowingCustomScriptWarningFor(null)}
+    />
+  );
+
   if (!isModal) {
-    return content;
+    return (
+      <>
+        {content}
+        {warningModal}
+      </>
+    );
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl">
-      {content}
-    </div>
+    <>
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl">
+        {content}
+      </div>
+      {warningModal}
+    </>
   );
 };

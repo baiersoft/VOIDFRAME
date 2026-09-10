@@ -80,6 +80,9 @@ impl DataRoot {
     pub fn logs_dir(&self) -> PathBuf {
         self.0.join("logs")
     }
+    pub fn recovery_dir(&self) -> PathBuf {
+        self.path().join("recovery")
+    }
     pub fn config_path(&self) -> PathBuf {
         self.0.join("config.json")
     }

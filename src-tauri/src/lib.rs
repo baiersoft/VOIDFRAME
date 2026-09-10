@@ -2,6 +2,7 @@
 use tauri::{Emitter, Manager, WebviewWindow, WindowEvent};
 use tokio::sync::Mutex as AsyncMutex;
 
+mod cli_modes;
 mod commands;
 mod singleton_mutex;
 mod state;
@@ -75,15 +76,23 @@ pub fn build_specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::config::get_config,
             commands::config::save_config,
             commands::catalog::list_catalog_tweaks,
+            commands::cs2_config::read_cs2_video_config,
+            commands::custom_script::import_custom_script,
             commands::run::start_run,
+            commands::run::resume_run,
+            commands::run::is_resume_launch,
             commands::run::send_control,
+            commands::run::set_shutdown_when_complete,
             commands::results::get_results,
             commands::results::list_results,
             commands::results::get_run_snapshot,
+            commands::results::get_run_progress,
             commands::rollback::rollback_now,
             commands::rollback::emergency_rollback,
             commands::shell::open_data_dir,
             commands::shell::reveal_restore_bat,
+            commands::registry::read_registry_value,
+            commands::shutdown::cancel_shutdown,
         ])
         .typ::<voidframe_engine::run::EngineEvent>()
 }
@@ -155,6 +164,17 @@ pub fn run() {
         log::error!("{msg}");
     }));
 
+    // `--recover` is launched headless as SYSTEM by the deadman scheduled
+    // task (spec §5.2) — it must never contend for the GUI's own singleton
+    // mutex below, so this dispatch runs first and exits immediately.
+    // `resume_on_start` stays in scope (unused until Task 13's `setup` hook
+    // wires it to `resume_run`).
+    let cli_mode = cli_modes::parse(&std::env::args().collect::<Vec<_>>());
+    if let cli_modes::CliMode::Recover { data_root } = &cli_mode {
+        std::process::exit(cli_modes::run_recover(data_root.clone()));
+    }
+    let resume_on_start = cli_mode == cli_modes::CliMode::Resume;
+
     // The real single-instance guard `voidframe_engine::paths`'s own doc
     // comment already anticipated ("layers a Global\VOIDFRAME_SINGLETON
     // named mutex on top in a later phase") but was never actually built --
@@ -192,7 +212,7 @@ pub fn run() {
     // profile. `tauri::async_runtime::block_on` enters Tauri's own global
     // tokio runtime -- the same one the app then runs on -- so the store
     // actor's task attaches to it correctly and outlives this call.
-    let app_state = tauri::async_runtime::block_on(async { state::AppState::new() })
+    let app_state = tauri::async_runtime::block_on(async { state::AppState::new(resume_on_start) })
         .expect("failed to initialize AppState");
 
     // Must run here: strictly after the single-instance lock `AppState::new()`
@@ -337,6 +357,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         // Guards against quitting mid-run (see `should_block_close`'s own
         // doc comment): a plain `close_window`/OS close button previously
@@ -382,6 +403,25 @@ pub fn run() {
                 voidframe_engine::model::seed_alpha_test_project(&state.data_root.projects_dir())
             {
                 log::warn!("failed to seed the Alpha Test starter project: {e}");
+            }
+
+            // `voidframe.exe --resume` (spec §3.4): the resume scheduled
+            // task launches this exact invocation at the user's logon.
+            // Spawned rather than awaited here -- `.setup()`'s own closure
+            // is not async, and a run legitimately takes far longer than
+            // `setup` should ever block for. Errors (no `RebootPending`
+            // snapshot, a missing/corrupt `progress.json`, an already-active
+            // run) are logged, not fatal -- the app still opens normally
+            // either way, same "degrade, don't crash" posture as the
+            // Alpha Test seeding right above.
+            if resume_on_start {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match commands::run::resume_run_impl(&handle).await {
+                        Ok(run_id) => log::info!("resumed run {run_id} after reboot"),
+                        Err(e) => log::error!("--resume: {e}"),
+                    }
+                });
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -465,9 +505,11 @@ mod close_guard_tests {
     #[tokio::test]
     async fn blocks_close_while_a_run_is_active() {
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_toggle_tx, _shutdown_toggle_rx) = tokio::sync::watch::channel(false);
         let active_run = AsyncMutex::new(Some(ActiveRun {
             run_id: "r1".into(),
             control_tx,
+            shutdown_toggle_tx,
         }));
         assert!(should_block_close(&active_run).await);
     }

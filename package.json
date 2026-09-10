@@ -1,7 +1,7 @@
 {
   "name": "voidframe",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -20,6 +20,7 @@
     "@fontsource/jetbrains-mono": "^5.1.0",
     "@fontsource/space-grotesk": "^5.1.0",
     "@tauri-apps/api": "^2.9.1",
+    "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2.5.3",
     "clsx": "^2.1.1",
     "lucide-react": "^0.475.0",

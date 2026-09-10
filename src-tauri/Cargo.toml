@@ -1,6 +1,6 @@
 [package]
 name = "voidframe"
-version = "0.1.1"
+version.workspace = true
 description = "baiersoft // VOIDFRAME — Autonomous CS2 Benchmark Orchestrator & System Matrix"
 authors = ["baiersoft"]
 edition.workspace = true
@@ -36,6 +36,7 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = ["specta"] }
+tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
 voidframe-engine = { path = "../crates/voidframe-engine", features = ["specta"] }

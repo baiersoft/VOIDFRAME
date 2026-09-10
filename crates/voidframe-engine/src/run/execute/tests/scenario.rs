@@ -36,7 +36,7 @@ async fn cpu_affinity_is_applied_only_after_menu_ready_not_right_after_process_d
     tokio::fs::write(&console_log_path, "").await.unwrap();
     write_signatures(dir.path());
     // 0 warmup, 0 measure: only the pre-iteration launch flow (discovery ->
-    // menu-ready -> affinity -> first reissue_map) matters for this test.
+    // menu-ready -> affinity -> first send_console_command) matters for this test.
     let settings = settings_with(0, 0, 5);
     // Pre-seeded to already match the reconciled value (no launch_args
     // module on this scenario) -- this test is about affinity timing, not
@@ -224,7 +224,7 @@ async fn measure_captures_land_under_the_run_scenario_directory_not_a_temp_file(
 
 #[tokio::test]
 async fn happy_path_runs_warmup_and_measure_iterations_and_reverts_cleanly() {
-    // SETTLE_BEFORE_CAPTURE alone would add 8s of real wall-clock time
+    // Dust2's 8s `settle_before_capture` alone would add 8s of real wall-clock time
     // per measure iteration (3, here) — tokio's virtual clock collapses
     // every `sleep`/`timeout` in this test (this one and the several
     // already inside `write_console_log_lines`/`LogTail::wait_for`) to
@@ -271,9 +271,9 @@ async fn happy_path_runs_warmup_and_measure_iterations_and_reverts_cleanly() {
     let sr = result.unwrap();
     assert_eq!(sr.per_iteration.len(), 3);
     assert_eq!(
-        sys.reissue_map_calls().len(),
+        sys.send_console_command_calls().len(),
         4,
-        "1 warmup + 3 measure reissue_map calls"
+        "1 warmup + 3 measure send_console_command calls"
     );
     assert_eq!(
         sys.hide_console_calls(),
@@ -684,5 +684,248 @@ async fn run_scenario_inner_warns_not_blocks_when_steam_elevated() {
     assert!(
         saw_elevated_warning,
         "must emit the informational LogLine about Steam running elevated"
+    );
+}
+
+/// I1 (2026-09-07 follow-up review): `revert_stage`'s reverse replay must be
+/// atomic with respect to operator cancellation. Abort is (correctly) still
+/// offered during `Phase::Scenario`/`Phase::Baseline`, but an Abort landing
+/// *inside* the replay would drop the run body with the journal only partly
+/// reverted -- and since a revert never clears a record's `applied` flag,
+/// that partial state is indistinguishable from an untouched journal, which
+/// is exactly why `rollback::in_flight_journal` refuses to force-revert a
+/// `Stage::Revert` cursor. The shield defers such an Abort instead of losing
+/// the revert half-done.
+///
+/// Observes the real `true` -> `false` transition, not just "didn't panic",
+/// following `mutation::power_plan`'s own shield test: the mock is given a
+/// genuine `.await` inside `write_powercfg` (the one call this journal
+/// record's revert makes), so the observer half of the `join!` runs while
+/// the replay is still in flight and can read the shield as `true` at that
+/// moment, then `false` once `revert_stage` returns. `tokio::time::pause()`
+/// makes that ordering deterministic rather than wall-clock dependent.
+#[tokio::test]
+async fn revert_stage_shields_its_journal_replay_and_releases_it_afterwards() {
+    const SUB: &str = "sub_processor";
+    const SETTING: &str = "IDLEDISABLE";
+
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with(
+        dir.path().to_path_buf(),
+        settings_with(0, 0, 5),
+        dir.path().join("console.log"),
+    );
+    let scenario = Scenario {
+        id: "sc-revert-shield".into(),
+        name: "RevertShield".into(),
+        description: "d".into(),
+        enabled: true,
+        modules: vec![Module::Powercfg {
+            sub: SUB.into(),
+            setting: SETTING.into(),
+            value: 1,
+        }],
+    };
+    let mock = MockController::new()
+        .with_powercfg(SUB, SETTING, AcDc { ac: 0, dc: 0 })
+        .with_write_powercfg_delay(Duration::from_millis(150));
+    let (no_return_tx, mut no_return_rx) = tokio::sync::watch::channel(false);
+    let mut ctx = context_for(&config);
+    ctx.no_return = no_return_tx;
+    let (events_tx, _events_rx) = mpsc::channel(64);
+
+    // A real, fully-confirmed journal record for the replay to walk.
+    // `apply_stage` engages no shield of its own for a powercfg module, so
+    // the only `true` this test can observe below is `revert_stage`'s.
+    apply_stage(&mock, &scenario, &ctx, &events_tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.read_powercfg(SUB, SETTING).await.unwrap().ac,
+        1,
+        "sanity: there must be something live for the replay to put back"
+    );
+    assert!(
+        !*no_return_rx.borrow_and_update(),
+        "apply must not leave a shield engaged"
+    );
+
+    let revert = revert_stage(&mock, &scenario, &ctx, &events_tx);
+    // Bounded so a regression (the shield removed) fails here instead of
+    // hanging. Under paused time this budget costs nothing when the shield
+    // is present -- the `send(true)` happens before the mock's own `.await`,
+    // so `changed()` resolves with no time advanced at all.
+    let observer = async {
+        tokio::time::timeout(Duration::from_secs(5), no_return_rx.changed())
+            .await
+            .expect("the shield must engage while the journal replay is in flight")
+            .expect("the shield's sender must still be alive");
+        *no_return_rx.borrow_and_update()
+    };
+    let (report, engaged_mid_replay) = tokio::join!(revert, observer);
+    report.unwrap();
+
+    assert!(
+        engaged_mid_replay,
+        "the shield must read `true` while the reverse replay is still awaiting"
+    );
+    assert!(
+        !*no_return_rx.borrow(),
+        "the shield must be released again once `revert_stage` returns -- a permanently-set \
+         shield would make Abort dead for the rest of the run"
+    );
+    assert_eq!(
+        mock.read_powercfg(SUB, SETTING).await.unwrap().ac,
+        0,
+        "sanity: the shielded replay must actually have reverted the record"
+    );
+}
+
+/// AveYo's `benchmark.cfg` v2 must be triggered via its confirmed
+/// single-run alias body (`alias set v2;sv_cheats 1;exec_async benchmark`),
+/// never the Workshop-map `map_workshop ... de_dust2` command -- confirmed
+/// directly with the project's maintainer, not a guess (see
+/// `scenario.rs`'s `map_cmd` match arm doc comment).
+#[tokio::test]
+async fn aveyo_kind_triggers_the_confirmed_bb_command_instead_of_map_workshop() {
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let console_log_path = dir.path().join("console.log");
+    tokio::fs::write(&console_log_path, "").await.unwrap();
+    write_signatures(dir.path());
+
+    let mut settings = settings_with(1, 1, 10); // 1 warmup + 1 measure
+    settings.benchmark_kind = crate::model::BenchmarkKind::AveYoCfgV2;
+    let desired_args = crate::cs2::keybind_cfg::reconcile("");
+    let sys = MockController::new()
+        .with_steam_status(SteamStatus {
+            running: true,
+            elevated: false,
+        })
+        .with_launch_options(&desired_args)
+        .with_process_on_launch("cs2.exe", 4242);
+    let capture = MockCaptureRunner::new(vec![metrics(400.0)]);
+    let scenario = scenario_with_modules("sc1");
+    let config = config_with(dir.path().to_path_buf(), settings, console_log_path.clone());
+    let ctx = context_for(&config);
+
+    let (events_tx, mut events_rx) = mpsc::channel(64);
+    let (_control_tx, mut control_rx) = mpsc::channel(4);
+
+    let (result, ()) = tokio::join!(
+        run_scenario(
+            &sys,
+            &capture,
+            &scenario,
+            false,
+            &ctx,
+            &events_tx,
+            &mut control_rx,
+        ),
+        write_console_log_lines(console_log_path, 2), // 1 warmup + 1 measure
+    );
+    result.unwrap();
+    drop(events_tx);
+    while events_rx.try_recv().is_ok() {}
+
+    let calls = sys.send_console_command_calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "1 warmup + 1 measure send_console_command call"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|c| c == "alias set v2;sv_cheats 1;exec_async benchmark"),
+        "expected only the confirmed AveYo BB trigger, got {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn aveyo_kind_writes_both_aveyo_cfg_files_alongside_the_keybind_cfg() {
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let console_log_path = dir.path().join("console.log");
+    tokio::fs::write(&console_log_path, "").await.unwrap();
+    write_signatures(dir.path());
+
+    let mut settings = settings_with(0, 1, 10);
+    settings.benchmark_kind = crate::model::BenchmarkKind::AveYoCfgV2;
+    let desired_args = crate::cs2::keybind_cfg::reconcile("");
+    let sys = MockController::new()
+        .with_steam_status(SteamStatus {
+            running: true,
+            elevated: false,
+        })
+        .with_launch_options(&desired_args)
+        .with_process_on_launch("cs2.exe", 4242);
+    let scenario = scenario_with_modules("sc1");
+    let config = config_with(dir.path().to_path_buf(), settings, console_log_path);
+    let ctx = context_for(&config);
+
+    // The cfg files are written by `prepare_cs2_session`, before any
+    // iteration runs -- drive exactly that step, not a whole capture.
+    let (events_tx, _events_rx) = mpsc::channel(64);
+    let (_control_tx, mut control_rx) = mpsc::channel(4);
+    prepare_cs2_session(&sys, &scenario, &ctx, &events_tx, &mut control_rx)
+        .await
+        .unwrap();
+
+    let cfg_dir = dir.path().join("cfg");
+    assert!(cfg_dir.join(crate::cs2::keybind_cfg::CFG_FILENAME).exists());
+    assert!(
+        cfg_dir
+            .join(crate::cs2::aveyo_cfg::BENCHMARK_CFG_FILENAME)
+            .exists()
+    );
+    assert!(
+        cfg_dir
+            .join(crate::cs2::aveyo_cfg::BENCHMARK2_CFG_FILENAME)
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn workshop_dust2_kind_never_writes_the_aveyo_cfg_files() {
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    let console_log_path = dir.path().join("console.log");
+    tokio::fs::write(&console_log_path, "").await.unwrap();
+    write_signatures(dir.path());
+
+    let settings = settings_with(0, 1, 10); // defaults to WorkshopDust2
+    let desired_args = crate::cs2::keybind_cfg::reconcile("");
+    let sys = MockController::new()
+        .with_steam_status(SteamStatus {
+            running: true,
+            elevated: false,
+        })
+        .with_launch_options(&desired_args)
+        .with_process_on_launch("cs2.exe", 4242);
+    let scenario = scenario_with_modules("sc1");
+    let config = config_with(dir.path().to_path_buf(), settings, console_log_path);
+    let ctx = context_for(&config);
+
+    // The cfg files are written by `prepare_cs2_session`, before any
+    // iteration runs -- drive exactly that step, not a whole capture.
+    let (events_tx, _events_rx) = mpsc::channel(64);
+    let (_control_tx, mut control_rx) = mpsc::channel(4);
+    prepare_cs2_session(&sys, &scenario, &ctx, &events_tx, &mut control_rx)
+        .await
+        .unwrap();
+
+    let cfg_dir = dir.path().join("cfg");
+    assert!(cfg_dir.join(crate::cs2::keybind_cfg::CFG_FILENAME).exists());
+    assert!(
+        !cfg_dir
+            .join(crate::cs2::aveyo_cfg::BENCHMARK_CFG_FILENAME)
+            .exists()
+    );
+    assert!(
+        !cfg_dir
+            .join(crate::cs2::aveyo_cfg::BENCHMARK2_CFG_FILENAME)
+            .exists()
     );
 }

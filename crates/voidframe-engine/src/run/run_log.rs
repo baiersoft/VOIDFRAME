@@ -67,6 +67,15 @@ fn format_event(ev: &EngineEvent) -> String {
         EngineEvent::IterationStarted { kind, index } => {
             format!("Iteration {kind:?} #{index} started")
         }
+        EngineEvent::ThermalProgress {
+            sample,
+            total,
+            cpu_temp_celsius,
+            gpu_temp_celsius,
+        } => format!(
+            "Thermal sample {sample}/{total}: cpu={cpu_temp_celsius:.1}C gpu={}",
+            gpu_temp_celsius.map_or_else(|| "n/a".to_string(), |g| format!("{g:.1}C"))
+        ),
         EngineEvent::CapturePending => "Capture pending".into(),
         EngineEvent::CaptureResumed => "Capture resumed".into(),
         EngineEvent::RecordingStarted => "Recording started".into(),
@@ -75,8 +84,11 @@ fn format_event(ev: &EngineEvent) -> String {
             "Iteration complete: avg_fps={:.1} p1_fps={:.1} p01_fps={:.1}",
             metrics.avg_fps, metrics.p1_fps, metrics.p01_fps
         ),
-        EngineEvent::ScenarioComplete { result } => format!(
-            "Scenario '{}' complete: wcps={:.2} verdict={:?}",
+        EngineEvent::ScenarioComplete { result } => {
+            format!("Scenario '{}' complete", result.name)
+        }
+        EngineEvent::ScenarioScored { result } => format!(
+            "Scenario '{}' scored: wcps={:.2} verdict={:?}",
             result.name, result.wcps, result.verdict
         ),
         EngineEvent::OperatorPrompt { text } => format!("OPERATOR PROMPT: {text}"),
@@ -121,6 +133,7 @@ mod tests {
             metric_deltas: vec![],
             wcps,
             verdict: Verdict::Better,
+            script_reverted_unverified: false,
         }
     }
 
@@ -176,6 +189,27 @@ mod tests {
 
         let contents =
             std::fs::read_to_string(dir.path().join("runs").join("run-3").join("run.log")).unwrap();
+        assert!(contents.contains("High FPS"), "got: {contents}");
+        assert!(
+            !contents.contains("wcps"),
+            "ScenarioComplete carries a not-yet-scored placeholder -- run.log must not print it \
+             as if it were real (that's the bug ScenarioScored was added to fix); got: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_summarizes_a_scenario_scored_event_readably() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = RunLog::new(dir.path(), "run-4");
+
+        log.append(&EngineEvent::ScenarioScored {
+            result: scenario_result("High FPS", 12.5),
+        })
+        .await;
+
+        let contents =
+            std::fs::read_to_string(dir.path().join("runs").join("run-4").join("run.log")).unwrap();
+        assert!(contents.contains("scored"), "got: {contents}");
         assert!(contents.contains("High FPS"), "got: {contents}");
         assert!(contents.contains("12.5"), "got: {contents}");
     }

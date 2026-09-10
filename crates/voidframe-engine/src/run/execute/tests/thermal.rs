@@ -9,34 +9,95 @@ use super::super::thermal;
 
 /// Every test in this file drives `maybe_break`/`wait_for_thermal_cooldown`
 /// directly (not through a real `execute()` run), so each needs its own
-/// stand-in `ControlMsg` channel and abort signal -- neither is exercised by
-/// these tests (that's `scenario.rs`'s own tests' job), so a channel nothing
-/// ever sends on and an abort signal that's never set are the right
-/// defaults here.
-fn no_control_or_abort() -> (
+/// stand-in `ControlMsg` channel, abort signal, and `shutdown_toggle`
+/// channel -- none of the three is exercised by these tests (that's
+/// `scenario.rs`'s/`control.rs`'s own tests' job), so a channel nothing ever
+/// sends on, an abort signal that's never set, and an empty toggle channel
+/// are the right defaults here.
+fn no_control_abort_or_toggle() -> (
     mpsc::Receiver<ControlMsg>,
+    tokio::sync::watch::Receiver<bool>,
     tokio::sync::watch::Receiver<bool>,
 ) {
     let (_tx, rx) = mpsc::channel(1);
     let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
-    (rx, abort_rx)
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
+    (rx, abort_rx, shutdown_toggle_rx)
+}
+
+/// A minimal but valid `RunProgress` with the given thermal baseline --
+/// `maybe_break`/`wait_for_thermal_cooldown` read `progress.thermal_baseline`
+/// directly rather than taking it as its own parameter, and both also take
+/// `&mut RunProgress` for their own `control::drain_shutdown_toggle` calls.
+/// Field values don't matter beyond `thermal_baseline` -- none of these
+/// tests ever send on `shutdown_toggle`, so `drain_shutdown_toggle` never
+/// writes `progress.json` and `run_dir` below is never actually touched.
+fn progress_with_thermal_baseline(
+    thermal_baseline: Option<thermal::ThermalReading>,
+) -> RunProgress {
+    RunProgress {
+        schema_version: crate::model::SCHEMA_VERSION.to_string(),
+        run_id: "r1".into(),
+        project: Project {
+            schema_version: crate::model::SCHEMA_VERSION.to_string(),
+            id: "p1".into(),
+            name: "P".into(),
+            description: "d".into(),
+            created_at: "2026-09-06T00:00:00Z".into(),
+            settings: serde_json::from_str("{}").unwrap(),
+            baseline: Baseline {
+                name: "Stock".into(),
+                description: "d".into(),
+            },
+            scenarios: vec![],
+        },
+        start_build_id: None,
+        start_launch_args: String::new(),
+        start_launch_args_raw: String::new(),
+        start_power_plan: PowerPlan {
+            guid: "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
+            name: "Balanced".into(),
+            active: true,
+        },
+        thermal_baseline,
+        completed: vec![],
+        unstable: vec![],
+        cursor: Cursor {
+            index: 0,
+            stage: Stage::Apply,
+        },
+        reboot: None,
+        shutdown_when_complete: false,
+        skip_revert_once: false,
+        abort_requested: false,
+    }
+}
+
+/// Never actually written to -- every test in this file leaves
+/// `shutdown_toggle` empty, so `control::drain_shutdown_toggle` never saves.
+fn unused_run_dir() -> &'static std::path::Path {
+    std::path::Path::new("unused-run-dir")
 }
 
 #[tokio::test]
 async fn maybe_break_does_nothing_when_seconds_is_zero() {
     let sys = MockController::new();
     let (events_tx, mut events_rx) = mpsc::channel(4);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(None);
     let checks = maybe_break(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         0,
         None,
-        None,
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -57,17 +118,21 @@ async fn maybe_break_sleeps_and_logs_when_seconds_is_nonzero() {
     let sys = MockController::new();
     let start = tokio::time::Instant::now();
     let (events_tx, mut events_rx) = mpsc::channel(4);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(None);
     let checks = maybe_break(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         30,
         None,
-        None,
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -103,19 +168,23 @@ async fn maybe_break_with_no_thermal_baseline_sleeps_the_fixed_duration_unchange
     tokio::time::pause();
     let sys = MockController::new();
     let (events_tx, mut events_rx) = mpsc::channel(4);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(None);
     let start = tokio::time::Instant::now();
 
     let checks = maybe_break(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         5,
         None,
-        None,
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -177,18 +246,22 @@ async fn maybe_break_with_a_thermal_baseline_waits_until_within_3_degrees() {
     };
     let hwinfo_path = std::path::PathBuf::from("C:\\fake\\hwinfo.exe");
     let (events_tx, mut events_rx) = mpsc::channel(256);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(Some(baseline.clone()));
 
     let checks = maybe_break(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         0,
-        Some(&baseline),
         Some(&hwinfo_path),
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -225,6 +298,100 @@ async fn maybe_break_with_a_thermal_baseline_waits_until_within_3_degrees() {
     );
 }
 
+/// The UI has no other way to know a cooldown wait is under way (unlike a
+/// scenario or the pre-run baseline, nothing else changes for however long
+/// this takes) -- `maybe_break`'s thermal-mode branch must announce
+/// `Phase::ThermalCooldown` before it starts polling, and the fixed-time
+/// branches (no baseline yet, or thermal mode off) must NOT, since they
+/// have no live thermal sampling to show.
+#[tokio::test]
+async fn maybe_break_emits_thermal_cooldown_phase_only_on_the_thermal_mode_path() {
+    tokio::time::pause();
+    let sys = MockController::new().with_hwinfo_readings(hwinfo_readings_for_checks(&[62.0]));
+    let baseline = thermal::ThermalReading {
+        cpu_temp_celsius: 60.0,
+        gpu_temp_celsius: None,
+        sample_count: 30,
+    };
+    let hwinfo_path = std::path::PathBuf::from("C:\\fake\\hwinfo.exe");
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(Some(baseline));
+
+    maybe_break(
+        &sys,
+        &events_tx,
+        &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
+        abort_rx,
+        0,
+        Some(&hwinfo_path),
+        thermal::THERMAL_SAMPLE_INTERVAL,
+        thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await
+    .unwrap();
+
+    drop(events_tx);
+    let mut saw_cooldown_phase = false;
+    while let Ok(ev) = events_rx.try_recv() {
+        if matches!(
+            ev,
+            EngineEvent::PhaseChanged {
+                phase: Phase::ThermalCooldown
+            }
+        ) {
+            saw_cooldown_phase = true;
+        }
+    }
+    assert!(
+        saw_cooldown_phase,
+        "expected a PhaseChanged to Phase::ThermalCooldown before the cooldown poll started"
+    );
+}
+
+#[tokio::test]
+async fn maybe_break_never_emits_thermal_cooldown_phase_without_a_baseline() {
+    tokio::time::pause();
+    let sys = MockController::new();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(None);
+
+    maybe_break(
+        &sys,
+        &events_tx,
+        &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
+        abort_rx,
+        5,
+        None,
+        thermal::THERMAL_SAMPLE_INTERVAL,
+        thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await
+    .unwrap();
+
+    drop(events_tx);
+    let mut saw_phase_change = false;
+    while let Ok(ev) = events_rx.try_recv() {
+        if matches!(ev, EngineEvent::PhaseChanged { .. }) {
+            saw_phase_change = true;
+        }
+    }
+    assert!(
+        !saw_phase_change,
+        "the fixed-time-break path has no live thermal sampling to show and must not \
+         claim Phase::ThermalCooldown"
+    );
+}
+
 /// When HWiNFO is already running externally, the whole cooldown wait must
 /// never start or close it -- docs/superpowers/specs/2026-09-04-thermal-cooldown-hardware-info-design.md §A2's "only touch what we started" rule,
 /// same as [`maybe_break_with_a_thermal_baseline_waits_until_within_3_degrees`]
@@ -242,18 +409,22 @@ async fn maybe_break_thermal_cooldown_never_touches_hwinfo_when_already_running(
     };
     let hwinfo_path = std::path::PathBuf::from("C:\\fake\\hwinfo.exe");
     let (events_tx, _events_rx) = mpsc::channel(256);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(Some(baseline));
 
     let checks = maybe_break(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         0,
-        Some(&baseline),
         Some(&hwinfo_path),
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -291,19 +462,24 @@ async fn wait_for_thermal_cooldown_closes_hwinfo_once_when_the_max_wait_cap_is_r
     };
     let hwinfo_path = std::path::PathBuf::from("C:\\fake\\hwinfo.exe");
     let (events_tx, mut events_rx) = mpsc::channel(1024);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(Some(baseline.clone()));
     let start = tokio::time::Instant::now();
 
     let checks = wait_for_thermal_cooldown(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         &baseline,
         &hwinfo_path,
         30,
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -360,18 +536,23 @@ async fn wait_for_thermal_cooldown_closes_hwinfo_once_when_a_sensor_read_fails_m
     };
     let hwinfo_path = std::path::PathBuf::from("C:\\fake\\hwinfo.exe");
     let (events_tx, mut events_rx) = mpsc::channel(1024);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(Some(baseline.clone()));
 
     let checks = wait_for_thermal_cooldown(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         &baseline,
         &hwinfo_path,
         0,
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -416,19 +597,24 @@ async fn wait_for_thermal_cooldown_falls_back_to_the_fixed_sleep_when_start_hwin
     };
     let hwinfo_path = std::path::PathBuf::from("C:\\fake\\hwinfo.exe");
     let (events_tx, mut events_rx) = mpsc::channel(16);
-    let (mut control_rx, abort_rx) = no_control_or_abort();
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(Some(baseline.clone()));
     let start = tokio::time::Instant::now();
 
     let checks = wait_for_thermal_cooldown(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_rx,
         &baseline,
         &hwinfo_path,
         45,
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap();
@@ -484,17 +670,23 @@ async fn wait_for_thermal_cooldown_aborts_and_still_closes_hwinfo_it_started() {
         abort_tx.send(true).unwrap();
         (rx, abort_rx)
     };
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
+    let mut progress = progress_with_thermal_baseline(Some(baseline.clone()));
 
     let err = wait_for_thermal_cooldown(
         &sys,
         &events_tx,
         &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
         abort_tx_rx,
         &baseline,
         &hwinfo_path,
         0,
         thermal::THERMAL_SAMPLE_INTERVAL,
         thermal::THERMAL_SAMPLE_COUNT,
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
     .unwrap_err();
@@ -504,5 +696,143 @@ async fn wait_for_thermal_cooldown_aborts_and_still_closes_hwinfo_it_started() {
         sys.close_hwinfo_calls(),
         1,
         "must close HWiNFO it started even when exiting via abort"
+    );
+}
+
+/// Final-review finding, the cooldown-wait half of it (`thermal.rs`'s own
+/// `hwinfo_started_is_set_before_start_hwinfo_awaits_...` covers
+/// `collect_thermal_sample`): `hwinfo_started` must already read `true` while
+/// this wait's own `start_hwinfo` is still in flight. The real `start_hwinfo`
+/// spawns HWiNFO *and* polls it ready for up to 15s inside one
+/// `spawn_blocking`, so the whole-body abort race dropping this future
+/// mid-start leaves HWiNFO genuinely running -- with the flag still `false`,
+/// `finalize_aborted_run` never closes it and the next run's
+/// `hwinfo_already_running()` check silently downgrades to a fixed-time break
+/// with no thermal baseline.
+#[tokio::test]
+async fn wait_for_thermal_cooldown_sets_hwinfo_started_before_start_hwinfo_awaits() {
+    tokio::time::pause();
+    let sys = MockController::new().with_start_hwinfo_delay(Duration::from_millis(150));
+    let baseline = thermal::ThermalReading {
+        cpu_temp_celsius: 60.0,
+        gpu_temp_celsius: None,
+        sample_count: 30,
+    };
+    let hwinfo_path = std::path::PathBuf::from("C:\\fake\\hwinfo.exe");
+    let (events_tx, _events_rx) = mpsc::channel(1024);
+    let (mut control_rx, abort_rx, shutdown_toggle_rx) = no_control_abort_or_toggle();
+    let mut progress = progress_with_thermal_baseline(Some(baseline.clone()));
+    let hwinfo_started = std::sync::atomic::AtomicBool::new(false);
+
+    let mut fut = Box::pin(wait_for_thermal_cooldown(
+        &sys,
+        &events_tx,
+        &mut control_rx,
+        &shutdown_toggle_rx,
+        &mut progress,
+        unused_run_dir(),
+        abort_rx,
+        &baseline,
+        &hwinfo_path,
+        0,
+        thermal::THERMAL_SAMPLE_INTERVAL,
+        thermal::THERMAL_SAMPLE_COUNT,
+        &hwinfo_started,
+    ));
+    tokio::select! {
+        _ = &mut fut => panic!("the mock's start_hwinfo delay must still be in flight"),
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    // The abort race's drop, reproduced: the body future is discarded while
+    // suspended inside `start_hwinfo`.
+    drop(fut);
+
+    assert_eq!(
+        sys.start_hwinfo_calls(),
+        1,
+        "sanity: the drop must land after start_hwinfo was entered, or this is vacuous"
+    );
+    assert!(
+        hwinfo_started.load(std::sync::atomic::Ordering::SeqCst),
+        "hwinfo_started must be set before start_hwinfo's await, or an abort landing mid-start \
+         strands a running HWiNFO the cleanup will never close"
+    );
+}
+
+/// Alpha-tester report: the break after the *last* scenario is pure dead
+/// time -- nothing follows it but ROLLBACK and REPORT, so the operator sat
+/// through a full thermal cooldown before seeing results. Drives a full
+/// `execute()` with two scenarios and a nonzero fixed-time break: exactly
+/// two breaks must run (after BASELINE, after scenario one), never a third
+/// after the final scenario.
+#[tokio::test]
+async fn execute_skips_the_break_after_the_last_scenario() {
+    tokio::time::pause();
+    let dir = tempfile::tempdir().unwrap();
+    write_signatures(dir.path());
+    let settings = settings_with(0, 3, 5);
+    let start_args = crate::cs2::keybind_cfg::reconcile("");
+    let mock = MockController::new()
+        .with_steam_status(SteamStatus {
+            running: true,
+            elevated: false,
+        })
+        .with_process("steam.exe", 9001)
+        .with_process_on_deelevate("steam.exe", 9002)
+        .with_process("steamwebhelper.exe", 9099)
+        .with_process_on_launch("cs2.exe", 9500)
+        .with_launch_options(&start_args);
+    let sys: Arc<dyn SystemController> = Arc::new(mock);
+    let capture: Arc<dyn CaptureRunner> = Arc::new(MockCaptureRunner::new(vec![
+        crate::mock_harness::mock_metrics(),
+        crate::mock_harness::mock_metrics(),
+        crate::mock_harness::mock_metrics(),
+    ]));
+
+    let mut config = config_with(
+        dir.path().to_path_buf(),
+        settings,
+        dir.path().join("console.log"),
+    );
+    config.mock_cs2_log = Some(Duration::from_millis(0));
+    config.inter_scenario_break_seconds = 5;
+    for id in ["sc-first", "sc-last"] {
+        config.project.scenarios.push(Scenario {
+            id: id.into(),
+            name: id.into(),
+            description: "d".into(),
+            enabled: true,
+            modules: vec![],
+        });
+    }
+
+    let (events_tx, mut events_rx) = mpsc::channel(1024);
+    let (_control_tx, control_rx) = mpsc::channel(4);
+    let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
+
+    let result = execute(
+        sys,
+        capture,
+        RunStart::Fresh(config),
+        events_tx,
+        control_rx,
+        abort_rx,
+        shutdown_toggle_rx,
+    )
+    .await;
+    result.expect("run should complete successfully");
+
+    let mut breaks = 0;
+    while let Ok(ev) = events_rx.try_recv() {
+        if let EngineEvent::LogLine { text } = ev
+            && text.starts_with("Cooldown break")
+        {
+            breaks += 1;
+        }
+    }
+    assert_eq!(
+        breaks, 2,
+        "expected a break after BASELINE and after the first scenario only, not after the last"
     );
 }

@@ -14,9 +14,10 @@
 //! this Rust port adds direction by reusing the score this same function
 //! now also computes, not by inventing a second statistical test.
 
+use super::thresholds::Margin;
 use super::{
-    CalibratedThresholds, TostResult, WcpsV3Weights, compute_wcps_v3, hotelling_t2_statistic,
-    tost_evaluate,
+    CalibratedThresholds, TostResult, WcpsV3Weights, any_metric_baseline_degenerate,
+    compute_wcps_v3, hotelling_t2_statistic, tost_evaluate,
 };
 use crate::model::results::Verdict;
 use rand::Rng;
@@ -30,10 +31,10 @@ use std::collections::BTreeMap;
 /// `thresholds` -- see `CalibratedThresholds::for_n`'s own doc for the
 /// currently-calibrated ladder). `throughput_margins` is the TOST
 /// equivalence margins for the 4 throughput metrics (pacing's margins come
-/// from `thresholds.pacing_tost_margins_pct` directly) -- see the note
+/// from `thresholds.pacing_tost_margins` directly) -- see the note
 /// below on why this stays a separate parameter.
 ///
-/// `calibrated_thresholds_v3.json` only ever stored `pacing_tost_margins_pct`
+/// `calibrated_thresholds_v3.json` only ever stored `pacing_tost_margins`
 /// (the 2 NEW metrics, whose margins this research trail actually
 /// calibrated and revised) -- the 4 throughput metrics' TOST margins
 /// (`3.0/3.0/3.0/10.0`) were an earlier, still-unrevised judgment call from
@@ -55,7 +56,7 @@ pub fn evaluate_verdict(
     thresholds: &CalibratedThresholds,
     throughput_metric_names: [&str; 4],
     pacing_metric_names: [&str; 2],
-    throughput_margins: &BTreeMap<String, f64>,
+    throughput_margins: &BTreeMap<String, Margin>,
     score_weights: &WcpsV3Weights,
     rng: &mut impl Rng,
 ) -> Option<(Verdict, TostResult, TostResult)> {
@@ -95,29 +96,40 @@ pub fn evaluate_verdict(
         .collect();
 
     let tost_throughput = tost_evaluate(&throughput_arrays, throughput_margins, rng);
-    let tost_pacing = tost_evaluate(&pacing_arrays, &thresholds.pacing_tost_margins_pct, rng);
+    let tost_pacing = tost_evaluate(&pacing_arrays, &thresholds.pacing_tost_margins, rng);
     let confirmed_same = tost_throughput.declared_same_all && tost_pacing.declared_same_all;
 
     let verdict = if different {
-        // Direction from the score's sign -- computed here (not skipped
-        // when `!different`) is unnecessary work only in the sense of an
-        // unused value on the ConfirmedSame/Inconclusive paths; computing
-        // it unconditionally keeps this function's control flow simple and
-        // the cost is negligible (6 more z-scores) next to the Hotelling/
-        // TOST work already done above.
-        let throughput_scenario_mean = column_means_4(throughput_scenario);
-        let pacing_scenario_mean = column_means_2(pacing_scenario);
-        let score = compute_wcps_v3(
-            throughput_baseline,
-            pacing_baseline,
-            throughput_scenario_mean,
-            pacing_scenario_mean,
-            score_weights,
-        );
-        if score >= 0.0 {
-            Verdict::Better
+        if any_metric_baseline_degenerate(throughput_baseline, pacing_baseline) {
+            // The score excluded at least one metric from its weighted sum
+            // (score.rs's z_score returns None for a zero-variance baseline
+            // metric). If that excluded metric is the one that made
+            // Hotelling flag `different`, the remaining metrics' sign is
+            // not a trustworthy direction -- see
+            // `any_metric_baseline_degenerate`'s own doc comment for the
+            // real-data failure mode this guards against.
+            Verdict::Inconclusive
         } else {
-            Verdict::Worse
+            // Direction from the score's sign -- computed here (not
+            // skipped when `!different`) is unnecessary work only in the
+            // sense of an unused value on the ConfirmedSame/Inconclusive
+            // paths; computing it unconditionally keeps this function's
+            // control flow simple and the cost is negligible (6 more
+            // z-scores) next to the Hotelling/TOST work already done above.
+            let throughput_scenario_mean = column_means_4(throughput_scenario);
+            let pacing_scenario_mean = column_means_2(pacing_scenario);
+            let score = compute_wcps_v3(
+                throughput_baseline,
+                pacing_baseline,
+                throughput_scenario_mean,
+                pacing_scenario_mean,
+                score_weights,
+            );
+            if score >= 0.0 {
+                Verdict::Better
+            } else {
+                Verdict::Worse
+            }
         }
     } else if confirmed_same {
         Verdict::ConfirmedSame
@@ -165,7 +177,7 @@ mod tests {
     const THROUGHPUT_NAMES: [&str; 4] = ["avg_fps", "p1_fps", "p01_fps", "adaptive_frame_time_cv"];
     const PACING_NAMES: [&str; 2] = ["stutter_count_pct", "mean_abs_animation_error_ms"];
 
-    fn throughput_margins() -> BTreeMap<String, f64> {
+    fn throughput_margins() -> BTreeMap<String, Margin> {
         [
             ("avg_fps", 3.0),
             ("p1_fps", 3.0),
@@ -173,7 +185,7 @@ mod tests {
             ("adaptive_frame_time_cv", 10.0),
         ]
         .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
+        .map(|(k, v)| (k.to_string(), Margin::RelativePct(v)))
         .collect()
     }
 

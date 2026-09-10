@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Rocket, X } from "lucide-react";
 import type { Project } from "../../lib/bindings";
 
@@ -15,8 +15,14 @@ const DEFAULT_COUNTDOWN_SECONDS = import.meta.env.MODE === "test" ? 0 : 5;
 interface RunCountdownModalProps {
   project: Project | null;
   onCancel: () => void;
-  onConfirm: () => void;
+  onConfirm: (opts: { shutdownWhenComplete: boolean }) => void;
   countdownSeconds?: number;
+  /** Default state of the "shut down when the run completes" checkbox --
+   * `Config.shutdown_when_complete_default` (spec §7/D3). */
+  shutdownDefault?: boolean;
+  /** `countReboots` over the queued project's enabled scenarios -- shown in
+   * the summary line so a reboot-heavy matrix isn't a silent surprise. */
+  rebootCount?: number;
 }
 
 // Once a run actually starts, `ControlMsg::Abort` is only checked between
@@ -41,6 +47,8 @@ export const RunCountdownModal: React.FC<RunCountdownModalProps> = ({
   onCancel,
   onConfirm,
   countdownSeconds = DEFAULT_COUNTDOWN_SECONDS,
+  shutdownDefault = false,
+  rebootCount = 0,
 }) => {
   if (!project) return null;
   return (
@@ -50,6 +58,8 @@ export const RunCountdownModal: React.FC<RunCountdownModalProps> = ({
       onCancel={onCancel}
       onConfirm={onConfirm}
       countdownSeconds={countdownSeconds}
+      shutdownDefault={shutdownDefault}
+      rebootCount={rebootCount}
     />
   );
 };
@@ -57,8 +67,10 @@ export const RunCountdownModal: React.FC<RunCountdownModalProps> = ({
 interface CountdownProps {
   project: Project;
   onCancel: () => void;
-  onConfirm: () => void;
+  onConfirm: (opts: { shutdownWhenComplete: boolean }) => void;
   countdownSeconds: number;
+  shutdownDefault: boolean;
+  rebootCount: number;
 }
 
 const Countdown: React.FC<CountdownProps> = ({
@@ -66,17 +78,29 @@ const Countdown: React.FC<CountdownProps> = ({
   onCancel,
   onConfirm,
   countdownSeconds,
+  shutdownDefault,
+  rebootCount,
 }) => {
   const [secondsLeft, setSecondsLeft] = useState(countdownSeconds);
+  const [shutdownWhenComplete, setShutdownWhenComplete] = useState(shutdownDefault);
+  // Read through refs at fire time so the tick effect below depends on
+  // `secondsLeft` alone: with `onConfirm`/`shutdownWhenComplete` in its
+  // dependency list, toggling the checkbox (or a parent re-render handing
+  // down a new callback) tore the pending 1s timeout down and re-armed it,
+  // stretching the countdown by up to a second per toggle.
+  const onConfirmRef = useRef(onConfirm);
+  onConfirmRef.current = onConfirm;
+  const shutdownRef = useRef(shutdownWhenComplete);
+  shutdownRef.current = shutdownWhenComplete;
 
   useEffect(() => {
     if (secondsLeft <= 0) {
-      onConfirm();
+      onConfirmRef.current({ shutdownWhenComplete: shutdownRef.current });
       return;
     }
     const id = setTimeout(() => setSecondsLeft((s) => s - 1), 1000);
     return () => clearTimeout(id);
-  }, [secondsLeft, onConfirm]);
+  }, [secondsLeft]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-xl">
@@ -107,6 +131,20 @@ const Countdown: React.FC<CountdownProps> = ({
             Once the run starts, it cannot be safely interrupted mid-scenario — leave your PC
             alone until it finishes. This is your last chance to cancel.
           </p>
+          <p className="text-[11px] font-mono text-white/40 text-center">
+            {rebootCount} reboot{rebootCount === 1 ? "" : "s"} · AutoLogon checked at pre-flight
+          </p>
+          <label className="flex items-center gap-2.5 w-full p-3 rounded-xl bg-black/40 border border-white/5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={shutdownWhenComplete}
+              onChange={(e) => setShutdownWhenComplete(e.target.checked)}
+              className="rounded bg-black/50 border-white/20 text-[#06b6d4] focus:ring-0 w-4 h-4 cursor-pointer"
+            />
+            <span className="text-xs font-mono text-white/80">
+              Shut down when the run completes
+            </span>
+          </label>
         </div>
 
         <div className="p-6 border-t border-white/10 bg-black/30 flex items-center justify-center">

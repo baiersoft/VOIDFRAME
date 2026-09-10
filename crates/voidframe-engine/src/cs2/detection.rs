@@ -6,6 +6,7 @@
 //! and matches the confirmed regex candidates from `spike/findings.md` §2.
 
 use crate::error::{Error, Result};
+use crate::model::BenchmarkKind;
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
@@ -32,11 +33,31 @@ pub struct Signatures {
     /// RelayNetworkStatus: ...`) — observed directly to coincide with the
     /// game becoming genuinely interactive, unlike the Win32 "window is
     /// visible" signal alone, which fires several seconds earlier (still
-    /// mid-intro/loading). This is the real readiness signal `reissue_map`
+    /// mid-intro/loading). This is the real readiness signal `send_console_command`
     /// needs; matching on the LAST of the two related SteamNetSockets lines
     /// (RelayNetworkStatus, not the ping-completed line before it) for the
     /// most conservative timing.
     pub menu_ready: String,
+    /// Optional per-kind override for `benchmark_started`/`benchmark_ended`,
+    /// honored only for `BenchmarkKind::AveYoCfgV2`. The bundled
+    /// `data/signatures.json` deliberately does NOT set these: a live run
+    /// confirmed AveYo's cfg emits the same `BeginMatch`/`Disconnected`
+    /// lines Dust2 does (spec D5's unverified first-pass guess, now
+    /// verified), so both kinds follow the shared keys above and an
+    /// operator fixing `benchmark_started` after a CS2 update fixes both at
+    /// once. Set these only if AveYo's lines ever diverge from Dust2's.
+    #[serde(default)]
+    pub aveyo_cfg_v2_benchmark_started: Option<String>,
+    #[serde(default)]
+    pub aveyo_cfg_v2_benchmark_ended: Option<String>,
+}
+
+/// The two log-line regexes that bracket one benchmark pass for a given
+/// [`BenchmarkKind`] -- see [`Signatures::markers_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchmarkMarkers<'a> {
+    pub started: &'a str,
+    pub ended: &'a str,
 }
 
 impl Signatures {
@@ -44,6 +65,28 @@ impl Signatures {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::msg(format!("reading {}: {e}", path.display())))?;
         serde_json::from_str(&text).map_err(Error::from)
+    }
+
+    /// The started/ended regexes for `kind`: the shared pair, unless an
+    /// AveYo-specific override is set (see the field doc comment).
+    pub fn markers_for(&self, kind: BenchmarkKind) -> BenchmarkMarkers<'_> {
+        let shared = BenchmarkMarkers {
+            started: &self.benchmark_started,
+            ended: &self.benchmark_ended,
+        };
+        match kind {
+            BenchmarkKind::WorkshopDust2 => shared,
+            BenchmarkKind::AveYoCfgV2 => BenchmarkMarkers {
+                started: self
+                    .aveyo_cfg_v2_benchmark_started
+                    .as_deref()
+                    .unwrap_or(shared.started),
+                ended: self
+                    .aveyo_cfg_v2_benchmark_ended
+                    .as_deref()
+                    .unwrap_or(shared.ended),
+            },
+        }
     }
 }
 
@@ -198,7 +241,7 @@ async fn created_of(file: &File) -> Option<SystemTime> {
 }
 
 impl RealLogTail {
-    pub async fn open(path: &Path, sigs: &Signatures) -> Result<RealLogTail> {
+    pub async fn open(path: &Path, sigs: &Signatures, kind: BenchmarkKind) -> Result<RealLogTail> {
         let deadline = tokio::time::Instant::now() + OPEN_RETRY_BUDGET;
         let mut file = loop {
             match File::open(path).await {
@@ -223,14 +266,15 @@ impl RealLogTail {
             .seek(SeekFrom::End(0))
             .await
             .map_err(|e| Error::msg(format!("seeking {}: {e}", path.display())))?;
+        let markers = sigs.markers_for(kind);
         Ok(RealLogTail {
             path: path.to_path_buf(),
             reader: BufReader::new(file),
             pos,
             created,
             re_map: Regex::new(&sigs.map_loaded).map_err(|e| Error::msg(e.to_string()))?,
-            re_start: Regex::new(&sigs.benchmark_started).map_err(|e| Error::msg(e.to_string()))?,
-            re_end: Regex::new(&sigs.benchmark_ended).map_err(|e| Error::msg(e.to_string()))?,
+            re_start: Regex::new(markers.started).map_err(|e| Error::msg(e.to_string()))?,
+            re_end: Regex::new(markers.ended).map_err(|e| Error::msg(e.to_string()))?,
             re_fps: Regex::new(&sigs.vprof_fps).map_err(|e| Error::msg(e.to_string()))?,
             re_menu_ready: Regex::new(&sigs.menu_ready).map_err(|e| Error::msg(e.to_string()))?,
             lines_read: 0,
@@ -374,7 +418,53 @@ mod tests {
             benchmark_ended: r"\[Client\] Disconnected from server:".to_string(),
             vprof_fps: r"\[VProf\] FPS: Avg=(?P<avg>[\d.]+), P1=(?P<p1>[\d.]+)".to_string(),
             menu_ready: r"\[SteamNetSockets\] SDR RelayNetworkStatus:".to_string(),
+            aveyo_cfg_v2_benchmark_started: None,
+            aveyo_cfg_v2_benchmark_ended: None,
         }
+    }
+
+    #[test]
+    fn markers_fall_back_to_the_shared_regexes_when_no_override_is_set() {
+        let s = sigs();
+        let m = s.markers_for(BenchmarkKind::AveYoCfgV2);
+        assert_eq!(m.started, s.benchmark_started);
+        assert_eq!(m.ended, s.benchmark_ended);
+    }
+
+    #[test]
+    fn markers_use_the_kind_specific_override_when_set() {
+        let mut s = sigs();
+        s.aveyo_cfg_v2_benchmark_started = Some(r"CUSTOM_STARTED".to_string());
+        s.aveyo_cfg_v2_benchmark_ended = Some(r"CUSTOM_ENDED".to_string());
+        let m = s.markers_for(BenchmarkKind::AveYoCfgV2);
+        assert_eq!(m.started, "CUSTOM_STARTED");
+        assert_eq!(m.ended, "CUSTOM_ENDED");
+        // WorkshopDust2 is never affected by an AveYo-specific override.
+        assert_eq!(
+            s.markers_for(BenchmarkKind::WorkshopDust2).started,
+            s.benchmark_started
+        );
+    }
+
+    /// The bundled file must leave the override keys unset so both kinds
+    /// keep following the shared `benchmark_started`/`benchmark_ended` --
+    /// a seeded copy of the same regex would silently sever AveYo from any
+    /// later fix an operator makes to the shared key (see the field's doc
+    /// comment).
+    #[test]
+    fn bundled_signatures_json_leaves_the_aveyo_overrides_unset() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("data")
+            .join("signatures.json");
+        let s = Signatures::from_file(&path).unwrap();
+        assert_eq!(s.aveyo_cfg_v2_benchmark_started, None);
+        assert_eq!(s.aveyo_cfg_v2_benchmark_ended, None);
+        assert_eq!(
+            s.markers_for(BenchmarkKind::AveYoCfgV2),
+            s.markers_for(BenchmarkKind::WorkshopDust2)
+        );
     }
 
     #[test]
@@ -475,7 +565,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut tail = RealLogTail::open(&path, &sigs()).await.unwrap();
+        let mut tail =
+            RealLogTail::open(&path, &sigs(), crate::model::BenchmarkKind::WorkshopDust2)
+                .await
+                .unwrap();
 
         let result = tail
             .wait_for(Duration::from_millis(300), &mut |ev| {
@@ -490,7 +583,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("console.log");
         tokio::fs::write(&path, "").await.unwrap();
-        let mut tail = RealLogTail::open(&path, &sigs()).await.unwrap();
+        let mut tail =
+            RealLogTail::open(&path, &sigs(), crate::model::BenchmarkKind::WorkshopDust2)
+                .await
+                .unwrap();
         let result = tail
             .wait_for(Duration::from_millis(300), &mut |ev| {
                 matches!(ev, DetectionEvent::BenchmarkStarted)
@@ -525,7 +621,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("console.log");
         tokio::fs::write(&path, "").await.unwrap();
-        let mut tail = RealLogTail::open(&path, &sigs()).await.unwrap();
+        let mut tail =
+            RealLogTail::open(&path, &sigs(), crate::model::BenchmarkKind::WorkshopDust2)
+                .await
+                .unwrap();
 
         let path2 = path.clone();
         let writer = async move {
@@ -572,7 +671,10 @@ mod tests {
         tokio::fs::write(&path, "pre-existing content padding out the file\n")
             .await
             .unwrap();
-        let mut tail = RealLogTail::open(&path, &sigs()).await.unwrap();
+        let mut tail =
+            RealLogTail::open(&path, &sigs(), crate::model::BenchmarkKind::WorkshopDust2)
+                .await
+                .unwrap();
 
         let path2 = path.clone();
         let writer = async move {
@@ -611,7 +713,10 @@ mod tests {
         };
 
         let s = sigs();
-        let (result, ()) = tokio::join!(RealLogTail::open(&path, &s), creator);
+        let (result, ()) = tokio::join!(
+            RealLogTail::open(&path, &s, crate::model::BenchmarkKind::WorkshopDust2),
+            creator
+        );
         assert!(
             result.is_ok(),
             "open should retry until the file appears rather than failing immediately"

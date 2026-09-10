@@ -12,7 +12,7 @@
 //! since nothing here redefines those structs by hand.
 //!
 //! The `SendInput` calls below only reach CS2 if CS2's own window is the
-//! foreground window at the OS level. `reissue_map_sync` therefore looks
+//! foreground window at the OS level. `send_console_command_sync` therefore looks
 //! CS2's window up explicitly by process name (`cs2.exe`, via the sibling
 //! `process` module's process lookup + `EnumWindows`) rather than trusting
 //! whatever window happens to have focus already — see `spike/findings.md`
@@ -272,7 +272,7 @@ fn wait_for_visible_window(pid: u32, timeout: Duration) -> Option<HWND> {
 
 /// Buffer after CS2's window is found and foregrounded, before sending any
 /// input. `run::execute::wait_for_menu_ready` (a real `console.log` signal,
-/// checked once per CS2 launch before the first `reissue_map` call) answers
+/// checked once per CS2 launch before the first `send_console_command` call) answers
 /// the *game-logic* readiness question, but does not replace this: live
 /// testing directly disproved the assumption that it made a short local
 /// settle sufficient. Shrinking this to 500ms (on that assumption) broke a
@@ -300,7 +300,7 @@ const BEFORE_SUBMIT: Duration = Duration::from_millis(200);
 
 /// Finds cs2.exe's window, brings it to the foreground (verifying the OS
 /// actually agreed, not just trusting the return value), and settles for
-/// `settle` before returning. Shared by `reissue_map_sync` (a long settle —
+/// `settle` before returning. Shared by `send_console_command_sync` (a long settle —
 /// this may be the first input sent after a fresh launch/relaunch) and
 /// `hide_console_sync` (a short settle — by the time that runs, the caller
 /// has already confirmed via `console.log` that CS2 is fully interactive).
@@ -332,7 +332,7 @@ fn foreground_cs2(settle: Duration) -> Result<()> {
     Ok(())
 }
 
-fn reissue_map_sync(map_command: &str) -> Result<()> {
+fn send_console_command_sync(command: &str) -> Result<()> {
     foreground_cs2(SETTLE_AFTER_WINDOW_FOUND)?;
 
     press_and_release(VK_F9)?; // toggleconsole (open — see keybind_cfg for why toggleconsole, not showconsole)
@@ -343,7 +343,7 @@ fn reissue_map_sync(map_command: &str) -> Result<()> {
     // Enter, and no console.log output at all.
     std::thread::sleep(AFTER_CONSOLE_OPEN);
 
-    type_unicode(map_command)?;
+    type_unicode(command)?;
     std::thread::sleep(BEFORE_SUBMIT);
 
     press_and_release(VK_RETURN)?;
@@ -358,11 +358,11 @@ fn reissue_map_sync(map_command: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn reissue_map(map_command: &str) -> Result<()> {
-    let map_command = map_command.to_string();
-    tokio::task::spawn_blocking(move || reissue_map_sync(&map_command))
+pub async fn send_console_command(command: &str) -> Result<()> {
+    let command = command.to_string();
+    tokio::task::spawn_blocking(move || send_console_command_sync(&command))
         .await
-        .map_err(|e| Error::msg(format!("reissue_map task panicked: {e}")))?
+        .map_err(|e| Error::msg(format!("send_console_command task panicked: {e}")))?
 }
 
 /// Settle after re-foregrounding CS2's window, before sending `Escape`.
@@ -409,7 +409,7 @@ pub async fn hide_console() -> Result<()> {
 /// succeeds) — the pattern matches an anti-cheat protection (CS2 uses VAC)
 /// blocking external termination of a live session, not a VOIDFRAME bug.
 /// Best-effort: if cs2.exe isn't running, or its window can't be found/
-/// foregrounded, this returns `Err` the same way `reissue_map` would — the
+/// foregrounded, this returns `Err` the same way `send_console_command` would — the
 /// caller (`run::execute::graceful_kill_cs2`) treats that as "graceful
 /// quit didn't work this time" and falls back to force-killing, not as
 /// fatal.

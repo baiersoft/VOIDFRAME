@@ -82,7 +82,7 @@ pub struct AcDc<T> {
     pub dc: T,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct PowerPlan {
     pub guid: String,
@@ -187,6 +187,63 @@ pub struct AppManifest {
     pub state_flags: Option<u32>,
 }
 
+/// Boot facts for classification (spec §4): whether Kernel-Power event 41 or
+/// BugCheck event 1001 landed in the System log since a given time, any new
+/// minidumps, and the BCD safeboot option, if the current boot entry has one
+/// set. See `system::windows::boot_report`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BootReport {
+    pub kernel_power_41: bool,
+    pub bugcheck_1001: bool,
+    pub new_minidumps: Vec<PathBuf>,
+    pub safeboot_option: Option<String>,
+}
+
+/// The captured result of a `SystemController::run_script` call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// BitLocker protection status of the system volume, from WMI
+/// `Win32_EncryptableVolume.ProtectionStatus`. See
+/// `system::windows::bitlocker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitlockerStatus {
+    Off,
+    On,
+    Unknown,
+}
+
+pub const RESUME_TASK_NAME: &str = "VOIDFRAME_Resume";
+pub const DEADMAN_TASK_NAME: &str = "VOIDFRAME_Deadman";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskTrigger {
+    AtLogonOfCurrentUser,
+    AtBootDelayed { minutes: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPrincipal {
+    /// The interactive user, run with highest privileges (no UAC prompt).
+    CurrentUserHighest,
+    /// `NT AUTHORITY\SYSTEM` — the deadman must run even if nobody logs on.
+    LocalSystem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSpec {
+    pub name: String,
+    pub description: String,
+    pub trigger: TaskTrigger,
+    pub principal: TaskPrincipal,
+    pub exe: PathBuf,
+    pub args: String,
+}
+
 #[async_trait]
 pub trait SystemController: Send + Sync {
     // registry
@@ -198,6 +255,14 @@ pub trait SystemController: Send + Sync {
     async fn read_powercfg(&self, sub: &str, setting: &str) -> Result<AcDc<u32>>;
     async fn write_powercfg(&self, sub: &str, setting: &str, v: u32, c: &MutationCtx)
     -> Result<()>;
+    /// Resolves the active Steam account's real, on-disk `cs2_video.txt`
+    /// path without reading or writing it -- callers that only need the
+    /// path itself (`run/execute/mod.rs`'s restore-script generation) use
+    /// this instead of `read_cs2_video_config`, so they don't pay for a
+    /// full file read just to know where the file is.
+    async fn find_cs2_video_config_path(&self) -> Result<std::path::PathBuf>;
+    async fn read_cs2_video_config(&self) -> Result<String>;
+    async fn write_cs2_video_config(&self, text: &str) -> Result<()>;
 
     // power plans
     async fn list_power_plans(&self) -> Result<Vec<PowerPlan>>;
@@ -252,11 +317,21 @@ pub trait SystemController: Send + Sync {
     /// actually terminated, and nothing on this trait provided that before
     /// (the earlier process-control subset was find/suspend/resume only).
     async fn kill_process_tree(&self, pid: u32) -> Result<()>;
-    async fn reissue_map(&self, map_command: &str) -> Result<()>;
+    /// Types `command` into CS2's console and submits it: foregrounds the
+    /// CS2 window, opens the console via the `F9`/`toggleconsole` bind
+    /// `cs2::keybind_cfg` guarantees, types the text, presses Enter. The
+    /// console is deliberately left open -- `hide_console` closes it once
+    /// the caller has confirmed from `console.log` that whatever the command
+    /// started has finished. No knowledge of what `command` is: the Dust2
+    /// benchmark sends `map_workshop ...`, AveYo's sends its alias body
+    /// (`run/execute/scenario.rs`), and nothing here is map-specific (spec
+    /// 2026-09-09 D3 -- formerly named `reissue_map` after its first
+    /// caller).
+    async fn send_console_command(&self, command: &str) -> Result<()>;
     /// Closes CS2's console (`Escape`, Source engine's standard dismiss
-    /// key — not the `F9`/`toggleconsole` bind `reissue_map` uses to open
+    /// key — not the `F9`/`toggleconsole` bind `send_console_command` uses to open
     /// it) — call this once the caller has confirmed (via a real
-    /// `console.log` signal) that whatever `reissue_map` triggered has
+    /// `console.log` signal) that whatever `send_console_command` triggered has
     /// actually finished, not on a fixed delay. See `cs2::keybind_cfg`'s
     /// doc comment on `CFG_CONTENTS` for why closing was moved off that
     /// toggle keybind entirely.
@@ -323,6 +398,29 @@ pub trait SystemController: Send + Sync {
     /// layout and sensor-label text confirmed live against a real running
     /// HWiNFO instance; see `system::windows::hwinfo`.
     async fn read_hwinfo_sensors(&self) -> Result<HwinfoSensorSnapshot>;
+
+    // boot control (M3)
+    async fn reboot(&self, delay_secs: u32, message: &str) -> Result<()>;
+    async fn shutdown(&self, delay_secs: u32, message: &str) -> Result<()>;
+    async fn cancel_shutdown(&self) -> Result<()>;
+
+    // scheduled tasks (M3)
+    async fn register_task(&self, spec: &TaskSpec) -> Result<()>;
+    async fn deregister_task(&self, name: &str) -> Result<()>;
+    async fn task_exists(&self, name: &str) -> Result<bool>;
+
+    /// Runs a `.bat`/`.cmd`/`.ps1` script to completion, capturing its
+    /// output. Killed (via `kill_on_drop`) if it exceeds `timeout`.
+    async fn run_script(
+        &self,
+        path: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> Result<ScriptOutput>;
+
+    // boot facts / pre-flight facts / run hygiene (M3)
+    async fn boot_report(&self, since: std::time::SystemTime) -> Result<BootReport>;
+    async fn bitlocker_protection(&self) -> Result<BitlockerStatus>;
+    async fn inhibit_sleep(&self, on: bool) -> Result<()>;
 }
 
 // Lets an already-`Arc`'d controller -- most notably `Arc<dyn
@@ -353,6 +451,15 @@ impl<T: SystemController + ?Sized> SystemController for Arc<T> {
         c: &MutationCtx,
     ) -> Result<()> {
         (**self).write_powercfg(sub, setting, v, c).await
+    }
+    async fn find_cs2_video_config_path(&self) -> Result<std::path::PathBuf> {
+        (**self).find_cs2_video_config_path().await
+    }
+    async fn read_cs2_video_config(&self) -> Result<String> {
+        (**self).read_cs2_video_config().await
+    }
+    async fn write_cs2_video_config(&self, text: &str) -> Result<()> {
+        (**self).write_cs2_video_config(text).await
     }
     async fn list_power_plans(&self) -> Result<Vec<PowerPlan>> {
         (**self).list_power_plans().await
@@ -424,8 +531,8 @@ impl<T: SystemController + ?Sized> SystemController for Arc<T> {
     async fn kill_process_tree(&self, pid: u32) -> Result<()> {
         (**self).kill_process_tree(pid).await
     }
-    async fn reissue_map(&self, map_command: &str) -> Result<()> {
-        (**self).reissue_map(map_command).await
+    async fn send_console_command(&self, command: &str) -> Result<()> {
+        (**self).send_console_command(command).await
     }
     async fn hide_console(&self) -> Result<()> {
         (**self).hide_console().await
@@ -450,6 +557,40 @@ impl<T: SystemController + ?Sized> SystemController for Arc<T> {
     }
     async fn read_hwinfo_sensors(&self) -> Result<HwinfoSensorSnapshot> {
         (**self).read_hwinfo_sensors().await
+    }
+    async fn reboot(&self, delay_secs: u32, message: &str) -> Result<()> {
+        (**self).reboot(delay_secs, message).await
+    }
+    async fn shutdown(&self, delay_secs: u32, message: &str) -> Result<()> {
+        (**self).shutdown(delay_secs, message).await
+    }
+    async fn cancel_shutdown(&self) -> Result<()> {
+        (**self).cancel_shutdown().await
+    }
+    async fn register_task(&self, spec: &TaskSpec) -> Result<()> {
+        (**self).register_task(spec).await
+    }
+    async fn deregister_task(&self, name: &str) -> Result<()> {
+        (**self).deregister_task(name).await
+    }
+    async fn task_exists(&self, name: &str) -> Result<bool> {
+        (**self).task_exists(name).await
+    }
+    async fn run_script(
+        &self,
+        path: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> Result<ScriptOutput> {
+        (**self).run_script(path, timeout).await
+    }
+    async fn boot_report(&self, since: std::time::SystemTime) -> Result<BootReport> {
+        (**self).boot_report(since).await
+    }
+    async fn bitlocker_protection(&self) -> Result<BitlockerStatus> {
+        (**self).bitlocker_protection().await
+    }
+    async fn inhibit_sleep(&self, on: bool) -> Result<()> {
+        (**self).inhibit_sleep(on).await
     }
 }
 

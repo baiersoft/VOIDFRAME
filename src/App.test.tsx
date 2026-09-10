@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import App from "./App";
 import type { EngineEvent, RunSummary } from "./lib/bindings";
 
@@ -9,6 +9,18 @@ const mockValidateScenario = vi.fn();
 const mockStartRun = vi.fn();
 const mockGetResults = vi.fn();
 const mockSaveProject = vi.fn();
+const mockResumeRun = vi.fn();
+// Safe default (normal launch, not `--resume`) for every existing test that
+// doesn't care about the M3 autonomous-reboot resume-launch routing -- App
+// now fetches this alongside getRunSnapshot() on mount to decide whether a
+// non-null snapshot means "route straight into Monitor" (a real resume
+// already in progress) or the legacy crash banner. Tests that DO care
+// override with mockResolvedValueOnce/mockResolvedValue.
+const mockIsResumeLaunch = vi.fn().mockResolvedValue(false);
+// Safe default (no active-run progress) for every existing test that
+// doesn't care about the M3 reboot/progress wiring -- App now fetches this
+// once a run becomes active and again on PhaseChanged/ScenarioComplete.
+const mockGetRunProgress = vi.fn().mockResolvedValue(null);
 // Safe default (dry_run_default undefined -> handleRunProject's `?? false`)
 // for every existing test that doesn't care about Settings -- App now reads
 // this fresh on every Run Matrix click. Tests that DO care override with
@@ -44,12 +56,15 @@ vi.mock("./lib/api", async (importOriginal) => {
     ...actual,
     listProjects: (...args: unknown[]) => mockListProjects(...args),
     getRunSnapshot: (...args: unknown[]) => mockGetRunSnapshot(...args),
+    isResumeLaunch: (...args: unknown[]) => mockIsResumeLaunch(...args),
     validateScenario: (...args: unknown[]) => mockValidateScenario(...args),
     startRun: (...args: unknown[]) => mockStartRun(...args),
     getConfig: (...args: unknown[]) => mockGetConfig(...args),
     getResults: (...args: unknown[]) => mockGetResults(...args),
     listResults: (...args: unknown[]) => mockListResults(...args),
     saveProject: (...args: unknown[]) => mockSaveProject(...args),
+    resumeRun: (...args: unknown[]) => mockResumeRun(...args),
+    getRunProgress: (...args: unknown[]) => mockGetRunProgress(...args),
     subscribeToEngineEvents: (handler: (e: EngineEvent) => void) => mockSubscribeToEngineEvents(handler),
   };
 });
@@ -68,6 +83,9 @@ Element.prototype.scrollIntoView = vi.fn();
 beforeEach(() => {
   engineEventHandlers.length = 0;
   mockSubscribeToEngineEvents.mockClear();
+  mockResumeRun.mockReset();
+  mockGetRunProgress.mockReset().mockResolvedValue(null);
+  mockIsResumeLaunch.mockReset().mockResolvedValue(false);
 });
 
 const REAL_PROJECT = {
@@ -166,7 +184,7 @@ describe("App run gating", () => {
     await waitFor(() => screen.getByText("Real Project One"));
     fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
     await waitFor(() => {
-      expect(mockStartRun).toHaveBeenCalledWith("p1", false);
+      expect(mockStartRun).toHaveBeenCalledWith("p1", false, false);
     });
     // Navigated into the Monitor tab -- LiveMonitor's own "checking for an
     // active run" / active-run UI takes over (it does its own
@@ -185,7 +203,7 @@ describe("App run gating", () => {
     await waitFor(() => screen.getByText("Real Project One"));
     fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
     await waitFor(() => {
-      expect(mockStartRun).toHaveBeenCalledWith("p1", true);
+      expect(mockStartRun).toHaveBeenCalledWith("p1", true, false);
     });
   });
 
@@ -359,7 +377,7 @@ describe("App run-lifecycle state survives LiveMonitor being unmounted (tab swit
     await waitFor(() => screen.getByText("Real Project One"));
     fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
     await waitFor(() => {
-      expect(mockStartRun).toHaveBeenCalledWith("p1", false);
+      expect(mockStartRun).toHaveBeenCalledWith("p1", false, false);
     });
     // isRunInProgress is now true, and the Monitor tab shows an "ACTIVE"
     // badge for it -- and LiveMonitor, now mounted, has registered its own
@@ -444,3 +462,303 @@ describe("App falls back off a tab that stops being valid", () => {
     });
   });
 });
+
+describe("App reboot-core wiring (M3)", () => {
+  const PROGRESS_FOR_RUN_123 = {
+    schema_version: "1.0.0",
+    run_id: "run-123",
+    project: REAL_PROJECT,
+    start_build_id: null,
+    start_launch_args: "",
+    start_launch_args_raw: "",
+    start_power_plan: { guid: "g", name: "Balanced", active: true },
+    thermal_baseline: null,
+    completed: [],
+    unstable: [],
+    cursor: { index: 0, stage: "apply" },
+    reboot: null,
+    shutdown_when_complete: true,
+  };
+
+  beforeEach(() => {
+    mockListProjects.mockReset().mockResolvedValue([REAL_PROJECT]);
+    mockGetRunSnapshot.mockReset().mockResolvedValue(null);
+    mockValidateScenario.mockReset().mockResolvedValue([]);
+    mockStartRun.mockReset().mockResolvedValue("run-123");
+    mockGetResults.mockReset();
+    mockGetConfig.mockReset().mockResolvedValue({});
+  });
+
+  it("fetches getRunProgress once a run becomes active, and again on PhaseChanged", async () => {
+    mockGetRunProgress.mockResolvedValue(PROGRESS_FOR_RUN_123);
+    render(<App />);
+    await waitFor(() => screen.getByText("Real Project One"));
+    fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
+    await waitFor(() => {
+      expect(mockGetRunProgress).toHaveBeenCalledWith("run-123");
+    });
+    const callsAfterStart = mockGetRunProgress.mock.calls.length;
+
+    emit({ type: "PhaseChanged", phase: { kind: "baseline" } });
+    await waitFor(() => {
+      expect(mockGetRunProgress.mock.calls.length).toBeGreaterThan(callsAfterStart);
+    });
+  });
+
+  it("passes the config's shutdown_when_complete_default through the countdown modal into startRun's third argument", async () => {
+    mockGetConfig.mockResolvedValue({ shutdown_when_complete_default: true });
+    render(<App />);
+    await waitFor(() => screen.getByText("Real Project One"));
+    fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
+    await waitFor(() => {
+      expect(mockStartRun).toHaveBeenCalledWith("p1", false, true);
+    });
+  });
+
+  it("shows a Resume Run button on the dashboard for a reboot_pending crashed run, and resuming switches to the monitor tab", async () => {
+    mockGetRunSnapshot.mockResolvedValue({
+      schema_version: "1.0.0",
+      run_id: "run-999",
+      project_id: "p1",
+      phase: { kind: "reboot_pending", reason: "apply_next" },
+      current_scenario: "s1",
+      completed_scenarios: [],
+      revision: 2,
+    });
+    mockResumeRun.mockResolvedValue("run-999");
+    render(<App />);
+    await waitFor(() => screen.getByText("Real Project One"));
+
+    fireEvent.click(screen.getByRole("button", { name: /resume run/i }));
+    await waitFor(() => {
+      expect(mockResumeRun).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Real Project One")).not.toBeInTheDocument();
+    });
+  });
+
+  it("shows a Cancel shutdown button on the Results tab once RunComplete arrives and the run's progress had shutdown_when_complete set", async () => {
+    mockGetRunProgress.mockResolvedValue(PROGRESS_FOR_RUN_123);
+    mockListResults.mockResolvedValue([
+      { run_id: "run-123", project_id: "p1", completed_at: "2026-09-04T00:00:00Z", scenario_count: 0, winner_name: null, winner_wcps: null },
+    ]);
+    mockGetResults.mockResolvedValue({
+      schema_version: "1.0.0",
+      run_id: "run-123",
+      project_id: "p1",
+      completed_at: "2026-09-04T00:00:00Z",
+      detection_tier: "log_tail",
+      baseline: {
+        scenario_id: "baseline",
+        name: "Stock",
+        is_baseline: true,
+        aggregated: {
+          avg_fps: 400, median_fps: 400, p1_fps: 250, p01_fps: 180,
+          frame_time_mean_ms: 2.5, frame_time_stddev_ms: 0.2, frame_time_cv: 0.08,
+          adaptive_frame_time_cv: null, stutter_count_pct: null, mean_abs_animation_error_ms: null,
+          gpu_busy_ms: null, bottleneck_ratio: null, render_latency_ms: null,
+        },
+        per_iteration: [], metric_deltas: [], wcps: 0, verdict: "confirmed_same",
+      },
+      scenarios: [],
+    });
+    render(<App />);
+    await waitFor(() => screen.getByText("Real Project One"));
+    fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
+    await waitFor(() => {
+      expect(mockGetRunProgress).toHaveBeenCalledWith("run-123");
+    });
+
+    emit({ type: "RunComplete", run_id: "run-123" });
+    await waitFor(() => screen.getByRole("button", { name: /visualizer & charts/i }));
+    fireEvent.click(screen.getByRole("button", { name: /visualizer & charts/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /cancel shutdown/i })).toBeInTheDocument();
+    });
+  });
+
+  it("does not let a stale getRunProgress response from a previous run overwrite a newer run's progress", async () => {
+    mockStartRun.mockReset().mockResolvedValueOnce("run-A").mockResolvedValueOnce("run-B");
+    // Matches REAL_PROJECT's id ("p1") so LiveMonitor's own `hasActiveRun`
+    // check resolves true and it renders its live view (including the
+    // `progress.unstable` list used below) instead of "No active run".
+    mockGetRunSnapshot.mockReset().mockResolvedValue({
+      schema_version: "1.0.0",
+      run_id: "run-A",
+      project_id: "p1",
+      phase: { kind: "scenario", id: "s1" },
+      current_scenario: "s1",
+      completed_scenarios: [],
+      revision: 1,
+    });
+
+    // run-A's fetch never resolves on its own -- resolved manually below,
+    // after run-B has already become active, to simulate a PhaseChanged
+    // response arriving late.
+    let resolveStaleProgress: (value: unknown) => void = () => {};
+    const staleProgressPromise = new Promise((resolve) => {
+      resolveStaleProgress = resolve;
+    });
+    mockGetRunProgress.mockImplementation((runId: string) => {
+      if (runId === "run-A") return staleProgressPromise;
+      return Promise.resolve({
+        ...PROGRESS_FOR_RUN_123,
+        run_id: "run-B",
+        unstable: [{ scenario_id: "fresh-scenario", reason: "fresh" }],
+      });
+    });
+
+    render(<App />);
+    await waitFor(() => screen.getByText("Real Project One"));
+
+    fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
+    await waitFor(() => {
+      expect(mockGetRunProgress).toHaveBeenCalledWith("run-A");
+    });
+
+    // A PhaseChanged event while run-A is still active starts a second,
+    // also-pending fetch for run-A via `onEngineEvent`'s own switch case --
+    // the code path finding 1 fixes.
+    emit({ type: "PhaseChanged", phase: { kind: "baseline" } });
+
+    // Back to the dashboard, then start a second run -- activeRunId flips
+    // to run-B while run-A's getRunProgress is still unresolved.
+    fireEvent.click(screen.getByRole("button", { name: /project explorer/i }));
+    await waitFor(() => screen.getByRole("button", { name: /run matrix/i }));
+    fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("fresh-scenario")).toBeInTheDocument();
+    });
+
+    // Now the stale run-A response lands -- it must not clobber run-B's
+    // already-rendered progress.
+    resolveStaleProgress({
+      ...PROGRESS_FOR_RUN_123,
+      run_id: "run-A",
+      unstable: [{ scenario_id: "stale-scenario", reason: "stale" }],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("fresh-scenario")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("stale-scenario")).not.toBeInTheDocument();
+  });
+
+  it("retries the initial getRunProgress fetch when it races progress.json not existing yet, instead of leaving runProgress stuck at null", async () => {
+    // Mirrors the real race this test covers: startRun's command returns
+    // (and activeRunId is set) before the engine's PREFLIGHT+SNAPSHOT
+    // phases have written progress.json for the first time, so the very
+    // first getRunProgress call resolves `null` -- that is what the backend
+    // actually returns for an absent progress.json (`Ok(None)`), never a
+    // rejection. A matching snapshot lets LiveMonitor
+    // (rendered once the run starts) resolve `hasActiveRun` true and show
+    // its live view -- including the shutdown checkbox this test reads to
+    // prove `runProgress` isn't stuck at `null`/stale after the retry.
+    mockGetRunSnapshot.mockReset().mockResolvedValue({
+      schema_version: "1.0.0",
+      run_id: "run-123",
+      project_id: "p1",
+      phase: { kind: "scenario", id: "s1" },
+      current_scenario: "s1",
+      completed_scenarios: [],
+      revision: 1,
+    });
+
+    let callCount = 0;
+    mockGetRunProgress.mockReset().mockImplementation((runId: string) => {
+      if (runId !== "run-123") return Promise.resolve(null);
+      callCount += 1;
+      // The very first call loses the race (progress.json doesn't exist
+      // yet, so the backend answers `null`); every later call (the retry)
+      // succeeds.
+      if (callCount === 1) return Promise.resolve(null);
+      return Promise.resolve(PROGRESS_FOR_RUN_123);
+    });
+
+    render(<App />);
+    await waitFor(() => screen.getByText("Real Project One"));
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(screen.getByRole("button", { name: /run matrix/i }));
+
+      // Advance in small steps rather than one large jump: the
+      // validateScenario -> getConfig -> startRun -> countdown modal's
+      // zero-second auto-confirm -> handleRunProject chain (all real
+      // Promise resolutions), the first failing getRunProgress attempt,
+      // and its 500ms-later retry each only progress once React has
+      // actually committed the previous step's state update (mirrors
+      // RunCountdownModal.test.tsx's own fake-timer test, which found a
+      // single large jump flakes for exactly this reason).
+      for (let i = 0; i < 60; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10);
+        });
+      }
+
+      // The retry happened (more than the one, losing attempt)...
+      expect(callCount).toBeGreaterThanOrEqual(2);
+      // ...and its successful response reached `runProgress` (and, through
+      // it, LiveMonitor's checkbox) instead of leaving it stuck at `null`.
+      expect(
+        screen.getByRole("checkbox", { name: /shut down when the run completes/i })
+      ).toBeChecked();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("routes straight into Monitor for a real --resume launch, without showing the crash banner or calling resumeRun again", async () => {
+    mockGetRunSnapshot.mockReset().mockResolvedValue({
+      schema_version: "1.0.0",
+      run_id: "resumed-run-1",
+      project_id: "p1",
+      phase: { kind: "boot_resume" },
+      current_scenario: "s1",
+      completed_scenarios: [],
+      revision: 4,
+    });
+    mockIsResumeLaunch.mockReset().mockResolvedValue(true);
+
+    render(<App />);
+
+    // Landed straight on Monitor for the resumed run -- the nav bar's
+    // "ACTIVE" badge is up, LiveMonitor rendered for the right project (it
+    // resolves the same activeRunId via its own getRunSnapshot() check),
+    // and the dashboard's project list is gone.
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeInTheDocument();
+      expect(screen.getByText(/Project: Real Project One/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Real Project One", { selector: "h3" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/did not complete cleanly/i)).not.toBeInTheDocument();
+    // The backend's own --resume setup hook already resumed this run --
+    // the frontend must not call resumeRun() a second time.
+    expect(mockResumeRun).not.toHaveBeenCalled();
+  });
+
+  it("still shows the crash banner for a non-null snapshot when isResumeLaunch resolves false (a normal launch)", async () => {
+    mockGetRunSnapshot.mockReset().mockResolvedValue({
+      schema_version: "1.0.0",
+      run_id: "stranded-run-1",
+      project_id: "p1",
+      phase: { kind: "boot_resume" },
+      current_scenario: "s1",
+      completed_scenarios: [],
+      revision: 4,
+    });
+    mockIsResumeLaunch.mockReset().mockResolvedValue(false);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/did not complete cleanly/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("ACTIVE")).not.toBeInTheDocument();
+    expect(mockResumeRun).not.toHaveBeenCalled();
+  });
+});
+

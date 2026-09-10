@@ -12,6 +12,7 @@ async fn preflight_block_stops_before_reaching_run_scenario() {
     );
     let capture: Arc<dyn CaptureRunner> = Arc::new(MockCaptureRunner::new(vec![]));
     let (_control_tx, control_rx) = tokio::sync::mpsc::channel(1);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
 
     let project = crate::model::project::Project {
         schema_version: crate::model::SCHEMA_VERSION.to_string(),
@@ -38,11 +39,20 @@ async fn preflight_block_stops_before_reaching_run_scenario() {
         thermal_sample_override: None,
         inter_scenario_break_seconds: 0,
         hwinfo_path: None,
+        shutdown_when_complete: false,
+        post_boot_settle: Duration::from_secs(0),
+        exe_path: PathBuf::from("voidframe.exe"),
     };
 
     // Preflight blocks -> execute() returns Err -> spawn_run turns that Err
     // into exactly one RunFailed (execute() itself no longer emits one).
-    let mut handle = crate::run::spawn_run(sys, capture, config, control_rx);
+    let mut handle = crate::run::spawn_run(
+        sys,
+        capture,
+        crate::run::RunStart::Fresh(config),
+        control_rx,
+        shutdown_toggle_rx,
+    );
 
     let mut saw_failed = false;
     while let Some(ev) = handle.events.recv().await {
@@ -243,6 +253,7 @@ async fn scoring_computes_real_comparisons_and_results_json_round_trips() {
         detection_tier: DetectionTier::LogTail,
         baseline: baseline_result,
         scenarios: scenario_results,
+        unstable: vec![],
     };
     let results_path = dir
         .path()
@@ -307,12 +318,22 @@ async fn rollback_restores_power_plan_and_skips_a_fully_confirmed_journal() {
         thermal_sample_override: None,
         inter_scenario_break_seconds: 0,
         hwinfo_path: None,
+        shutdown_when_complete: false,
+        post_boot_settle: Duration::from_secs(0),
+        exe_path: PathBuf::from("voidframe.exe"),
     };
     let mut ctx = context_for(&config);
     ctx.start_power_plan = run_start_plan.clone();
     let (events_tx, mut events_rx) = mpsc::channel(16);
 
-    rollback(&sys, &ctx, &events_tx).await.unwrap();
+    rollback(
+        &sys,
+        &ctx,
+        &progress_at(&config, 0, Stage::Done),
+        &events_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         sys.active_power_plan().await.unwrap().guid,
@@ -380,12 +401,22 @@ async fn rollback_defensively_reverts_a_journal_left_with_unconfirmed_entries() 
         thermal_sample_override: None,
         inter_scenario_break_seconds: 0,
         hwinfo_path: None,
+        shutdown_when_complete: false,
+        post_boot_settle: Duration::from_secs(0),
+        exe_path: PathBuf::from("voidframe.exe"),
     };
     let mut ctx = context_for(&config);
     ctx.start_power_plan = run_start_plan;
     let (events_tx, mut events_rx) = mpsc::channel(16);
 
-    rollback(&sys, &ctx, &events_tx).await.unwrap();
+    rollback(
+        &sys,
+        &ctx,
+        &progress_at(&config, 0, Stage::Done),
+        &events_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         sys.read_powercfg("sub_processor", "IDLEDISABLE")
@@ -532,4 +563,50 @@ async fn hwinfo_check_records_a_failing_read_but_still_closes_what_it_started() 
     // Cleanup must still run even though the read step failed -- this call
     // started HWiNFO, so it must also close it.
     assert_eq!(sys.close_hwinfo_calls(), 1);
+}
+
+/// The engine-side gate for `Settings::validate_capture_window`: a
+/// hand-written AveYo project that kept Dust2's 105s capture default must
+/// fail at PREFLIGHT, before Steam or CS2 are ever touched.
+#[tokio::test]
+async fn an_aveyo_project_with_an_oversized_capture_fails_at_preflight() {
+    let mock = MockController::new();
+    let sys: Arc<dyn SystemController> = Arc::new(mock.clone());
+    let capture: Arc<dyn CaptureRunner> = Arc::new(MockCaptureRunner::new(vec![]));
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(1);
+    let (_shutdown_toggle_tx, shutdown_toggle_rx) = tokio::sync::watch::channel(false);
+
+    let mut settings = settings_with(0, 3, 5);
+    settings.benchmark_kind = crate::model::BenchmarkKind::AveYoCfgV2;
+    assert_eq!(
+        settings.capture_seconds, 105,
+        "sanity: the kind-blind serde default"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with(
+        dir.path().to_path_buf(),
+        settings,
+        dir.path().join("console.log"),
+    );
+
+    let mut handle = crate::run::spawn_run(
+        sys,
+        capture,
+        crate::run::RunStart::Fresh(config),
+        control_rx,
+        shutdown_toggle_rx,
+    );
+    let mut failure = None;
+    while let Some(ev) = handle.events.recv().await {
+        if let EngineEvent::RunFailed { reason } = ev {
+            failure = Some(reason);
+        }
+    }
+    let reason = failure.expect("the run must fail");
+    assert!(reason.contains("capture_seconds"), "{reason}");
+    assert_eq!(
+        mock.launch_cs2_calls(),
+        0,
+        "refused before anything was launched"
+    );
 }
