@@ -197,6 +197,9 @@ subscription to the Workshop map; the AveYo benchmark kind does not. See
 - [AutoLogon setup](docs/guides/autologon-setup.md) — the three ways to make
   Windows log in on its own for unattended reboot runs, and the one way not
   to.
+- [What happens when you press Run](docs/guides/what-happens-when-you-press-run.md)
+  — the run from start to finish: pre-flight, baseline, one tweak at a time,
+  reboots, rollback, and what you can safely do while it runs.
 - [Understanding your benchmark results](docs/guides/understanding-your-benchmark-results.md)
   — what every number on the Results screen means and which two a
   competitive player should actually look at.

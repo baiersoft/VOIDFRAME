@@ -25,7 +25,11 @@ jobs:
           $installer = Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
           if (-not $installer) { throw "No NSIS installer found under target/release/bundle/nsis" }
           $hash = Get-FileHash -Path $installer.FullName -Algorithm SHA256
-          "$($hash.Hash.ToLower())  $($installer.Name)" | Out-File -FilePath "SHA256SUMS.txt" -Encoding ascii
+          # LF-terminated, no BOM: Out-File would write CRLF, which makes
+          # `sha256sum -c` on Unix-style tools reject the line. Absolute path
+          # because .NET resolves relative paths against the process cwd, not
+          # PowerShell's current location.
+          [System.IO.File]::WriteAllText((Join-Path $PWD "SHA256SUMS.txt"), "$($hash.Hash.ToLower())  $($installer.Name)`n", [System.Text.Encoding]::ASCII)
           echo "INSTALLER_PATH=$($installer.FullName)" >> $env:GITHUB_ENV
       - name: Upload installer + checksum to the release
         uses: softprops/action-gh-release@v3
