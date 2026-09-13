@@ -168,7 +168,7 @@ impl SystemController for WindowsController {
         .map_err(|e| Error::msg(format!("appmanifest read task panicked: {e}")))?
     }
     async fn workshop_item_installed(&self, app_id: u32, item_id: &str) -> Result<bool> {
-        let dir = vdf::find_steam_path()
+        let dir = vdf::find_app_library_path(app_id)
             .await?
             .join("steamapps")
             .join("workshop")

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/voidframe-engine", "crates/voidframe-cli", "src-tauri"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"        # matches rust-toolchain.toml; MSRV-aware resolver stays on latest deps

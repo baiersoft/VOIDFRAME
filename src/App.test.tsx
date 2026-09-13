@@ -529,7 +529,10 @@ describe("App reboot-core wiring (M3)", () => {
     render(<App />);
     await waitFor(() => screen.getByText("Real Project One"));
 
-    fireEvent.click(screen.getByRole("button", { name: /resume run/i }));
+    // The crash banner is gated on the run snapshot resolving *and* the
+    // projects list finishing (see the `resumeLaunchInfo` effect in App.tsx),
+    // so waiting for the project card alone races it -- await the button.
+    fireEvent.click(await screen.findByRole("button", { name: /resume run/i }));
     await waitFor(() => {
       expect(mockResumeRun).toHaveBeenCalledTimes(1);
     });

@@ -292,7 +292,10 @@ pub trait SystemController: Send + Sync {
     /// `appmanifest_<app_id>.acf` facts; `Ok(None)` when the file does not
     /// exist (not installed).
     async fn app_manifest(&self, app_id: u32) -> Result<Option<AppManifest>>;
-    /// `<steam>\steamapps\workshop\content\<app_id>\<item_id>\` exists.
+    /// `<app_library>\steamapps\workshop\content\<app_id>\<item_id>\` exists,
+    /// where `<app_library>` is the Steam Library Folder that has `app_id`
+    /// installed (see `app_library_path`) — not necessarily the Steam
+    /// client's own install directory.
     async fn workshop_item_installed(&self, app_id: u32, item_id: &str) -> Result<bool>;
     /// Free bytes on the drive hosting the data root.
     async fn free_disk_bytes(&self) -> Result<u64>;
